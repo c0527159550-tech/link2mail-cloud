@@ -68,6 +68,8 @@ jobs:
             'image/png': '.png',
             'image/gif': '.gif',
             'image/webp': '.webp',
+            'image/avif': '.avif',
+            'image/bmp': '.bmp',
             'text/plain': '.txt',
             'text/csv': '.csv',
             'application/json': '.json',
@@ -156,6 +158,18 @@ jobs:
             if (host === 'drive.google.com') {
               const m = parsed.pathname.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
               if (m) return `https://drive.google.com/uc?export=download&id=${m[1]}`;
+              const openId = parsed.searchParams.get('id');
+              if (parsed.pathname === '/open' && openId && /^[a-zA-Z0-9_-]+$/.test(openId)) {
+                return `https://drive.google.com/uc?export=download&id=${openId}`;
+              }
+            }
+            if (host === 'docs.google.com') {
+              const docMatch = parsed.pathname.match(/\/document\/d\/([a-zA-Z0-9_-]+)/);
+              if (docMatch) return `https://docs.google.com/document/d/${docMatch[1]}/export?format=pdf`;
+              const sheetMatch = parsed.pathname.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/);
+              if (sheetMatch) return `https://docs.google.com/spreadsheets/d/${sheetMatch[1]}/export?format=xlsx`;
+              const slideMatch = parsed.pathname.match(/\/presentation\/d\/([a-zA-Z0-9_-]+)/);
+              if (slideMatch) return `https://docs.google.com/presentation/d/${slideMatch[1]}/export?format=pdf`;
             }
             if (host === 'www.dropbox.com' || host === 'dropbox.com') {
               parsed.searchParams.set('dl', '1');
@@ -191,40 +205,154 @@ jobs:
             return `file-${Date.now()}${ext || '.bin'}`;
           }
 
-          function extractEmbeddedMedia(baseUrl, html) {
-            const patterns = [
-              /<meta[^>]+property=["']og:video(?::secure_url|:url)?["'][^>]+content=["']([^"']+)["']/i,
-              /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:video(?::secure_url|:url)?["']/i,
-              /<meta[^>]+property=["']og:audio(?::secure_url|:url)?["'][^>]+content=["']([^"']+)["']/i,
-              /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:audio(?::secure_url|:url)?["']/i,
-              /<(?:video|audio|source)[^>]+src=["']([^"']+)["']/i,
-            ];
-            for (const rx of patterns) {
-              const m = html.match(rx);
-              if (!m || !m[1]) continue;
-              try {
-                const candidate = new URL(m[1].replace(/&amp;/g, '&'), baseUrl);
-                if (candidate.protocol === 'http:' || candidate.protocol === 'https:') return candidate.toString();
-              } catch {}
-            }
+          function decodeHtmlUrl(raw) {
+            return raw.replace(/&amp;/gi, '&').replace(/&#38;/g, '&').replace(/&#x26;/gi, '&').trim();
+          }
+
+          function getHtmlAttr(tag, attrName) {
+            const rx = new RegExp('(?:^|\\s)' + attrName + '\\s*=\\s*(?:"([^"]*)"|\'([^\']*)\'|([^\\s"\'=<>\\x60]+))', 'i');
+            const m = tag.match(rx);
+            const v = (m && (m[1] || m[2] || m[3])) || '';
+            return v.trim() || null;
+          }
+
+          function resolveHttpUrl(baseUrl, raw) {
+            if (!raw) return null;
+            const cleaned = decodeHtmlUrl(raw);
+            if (!cleaned || /^data:|^javascript:|^mailto:|^blob:/i.test(cleaned)) return null;
+            try {
+              const candidate = new URL(cleaned, baseUrl);
+              if (candidate.protocol === 'http:' || candidate.protocol === 'https:') return candidate.toString();
+            } catch {}
             return null;
           }
 
-          async function downloadFile(initialUrl, allowEmbeddedRetry = true) {
+          function pickBestSrcset(baseUrl, srcset) {
+            if (!srcset) return null;
+            let bestUrl = null;
+            let bestScore = -1;
+            for (const entry of srcset.split(',')) {
+              const parts = entry.trim().split(/\s+/);
+              const resolved = resolveHttpUrl(baseUrl, parts[0]);
+              if (!resolved) continue;
+              const desc = parts[1] || '';
+              let score = 1;
+              const wm = desc.match(/^(\d+)w$/i);
+              const xm = desc.match(/^(\d+(?:\.\d+)?)x$/i);
+              if (wm) score = Number(wm[1]);
+              else if (xm) score = Number(xm[1]) * 500;
+              if (score > bestScore) { bestScore = score; bestUrl = resolved; }
+            }
+            return bestUrl;
+          }
+
+          function isJunkImg(urlStr, tag) {
+            const l = urlStr.toLowerCase();
+            if (/\.svg(?:$|\?)|\.ico(?:$|\?)/i.test(l)) return true;
+            if (/(?:favicon|sprite|pixel|spacer|1x1|blank\.|spinner|loader|loading\.|emoji|analytics|beacon)/i.test(l)) return true;
+            if (tag) {
+              const w = Number(getHtmlAttr(tag, 'width') || '0');
+              const h = Number(getHtmlAttr(tag, 'height') || '0');
+              if ((w > 0 && w < 64) || (h > 0 && h < 64)) return true;
+            }
+            return false;
+          }
+
+          function extractEmbeddedMedia(baseUrl, html) {
+            const metaTags = html.match(/<meta\b[^>]*>/gi) || [];
+            const mediaMeta = new Set(['og:video:secure_url', 'og:video:url', 'og:video', 'twitter:player:stream', 'og:audio:secure_url', 'og:audio:url', 'og:audio']);
+            for (const tag of metaTags) {
+              const key = (getHtmlAttr(tag, 'property') || getHtmlAttr(tag, 'name') || '').toLowerCase();
+              if (!mediaMeta.has(key)) continue;
+              const u = resolveHttpUrl(baseUrl, getHtmlAttr(tag, 'content'));
+              if (u) return u;
+            }
+            const mediaTags = html.match(/<(?:video|audio|source)\b[^>]*>/gi) || [];
+            for (const tag of mediaTags) {
+              const u = resolveHttpUrl(baseUrl, getHtmlAttr(tag, 'src')) || resolveHttpUrl(baseUrl, getHtmlAttr(tag, 'data-src'));
+              if (u) return u;
+            }
+            const anchorTags = html.match(/<a\b[^>]*>/gi) || [];
+            for (const tag of anchorTags.slice(0, 120)) {
+              const candidate = resolveHttpUrl(baseUrl, getHtmlAttr(tag, 'href'));
+              if (!candidate) continue;
+              try {
+                const parsed = new URL(candidate);
+                const hasDl = /\bdownload\b/i.test(tag);
+                if (/\.(?:mp3|wav|m4a|ogg|flac|aac|mp4|webm|mov|mkv|pdf|zip|docx|xlsx|pptx)(?:$|\?)/i.test(parsed.pathname) || (hasDl && !/\.(?:html?|php|aspx?)$/i.test(parsed.pathname))) {
+                  return candidate;
+                }
+              } catch {}
+            }
+            const imageMeta = new Set(['og:image:secure_url', 'og:image:url', 'og:image', 'twitter:image:src', 'twitter:image', 'image']);
+            for (const tag of metaTags) {
+              const key = (getHtmlAttr(tag, 'property') || getHtmlAttr(tag, 'name') || getHtmlAttr(tag, 'itemprop') || '').toLowerCase();
+              if (!imageMeta.has(key)) continue;
+              const u = resolveHttpUrl(baseUrl, getHtmlAttr(tag, 'content'));
+              if (u && !isJunkImg(u, '')) return u;
+            }
+            const linkTags = html.match(/<link\b[^>]*>/gi) || [];
+            for (const tag of linkTags) {
+              if ((getHtmlAttr(tag, 'rel') || '').toLowerCase().includes('image_src')) {
+                const u = resolveHttpUrl(baseUrl, getHtmlAttr(tag, 'href'));
+                if (u && !isJunkImg(u, '')) return u;
+              }
+            }
+            const jsonLdMatches = html.match(/"(?:contentUrl|image)"\s*:\s*"(https?:\\?\/\\?\/[^"]+)"/gi) || [];
+            for (const entry of jsonLdMatches) {
+              const m = entry.match(/"(https?:[^"]+)"/i);
+              if (!m || !m[1]) continue;
+              const candidate = resolveHttpUrl(baseUrl, m[1].replace(/\\\//g, '/'));
+              if (candidate && /\.(?:jpe?g|png|webp|gif|avif|mp4|mp3)(?:$|\?)/i.test(candidate) && !isJunkImg(candidate, '')) return candidate;
+            }
+            const imgTags = html.match(/<img\b[^>]*>/gi) || [];
+            let bestUrl = null;
+            let bestScore = -1;
+            for (const tag of imgTags.slice(0, 80)) {
+              const candidate =
+                pickBestSrcset(baseUrl, getHtmlAttr(tag, 'data-srcset')) ||
+                pickBestSrcset(baseUrl, getHtmlAttr(tag, 'srcset')) ||
+                resolveHttpUrl(baseUrl, getHtmlAttr(tag, 'data-original')) ||
+                resolveHttpUrl(baseUrl, getHtmlAttr(tag, 'data-lazy-src')) ||
+                resolveHttpUrl(baseUrl, getHtmlAttr(tag, 'data-src')) ||
+                resolveHttpUrl(baseUrl, getHtmlAttr(tag, 'src'));
+              if (!candidate || isJunkImg(candidate, tag)) continue;
+              let score = 10;
+              const lower = candidate.toLowerCase();
+              const info = ((getHtmlAttr(tag, 'class') || '') + ' ' + (getHtmlAttr(tag, 'alt') || '')).toLowerCase();
+              const w = Number(getHtmlAttr(tag, 'width') || '0');
+              const h = Number(getHtmlAttr(tag, 'height') || '0');
+              if (w >= 300) score += 40; else if (w >= 150) score += 20;
+              if (h >= 200) score += 20;
+              if (/\.(?:jpe?g|png|webp|avif)(?:$|\?)/i.test(lower)) score += 15;
+              if (/(?:uploads|media|images|photos|gallery|article|hero|cover|product)/i.test(lower)) score += 15;
+              if (/(?:hero|main|featured|photo|cover|gallery|product|article)/i.test(info)) score += 15;
+              if (/(?:logo|icon|avatar|badge|banner-ad|header)/i.test(lower + ' ' + info)) score -= 25;
+              if (score > bestScore) { bestScore = score; bestUrl = candidate; }
+            }
+            return bestUrl;
+          }
+
+          async function downloadFile(initialUrl, allowEmbeddedRetry = true, refererUrl = '') {
             const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
             try {
               let current = await validatePublicUrl(normalizeShareUrl(initialUrl));
               let res = null;
               for (let i = 0; i <= MAX_REDIRECTS; i++) {
+                const reqHeaders = {
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+                  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,audio/*,video/*,*/*;q=0.8',
+                  'Accept-Language': 'he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7',
+                };
+                if (refererUrl) {
+                  reqHeaders.Referer = refererUrl;
+                }
                 res = await fetch(current.toString(), {
                   method: 'GET',
                   redirect: 'manual',
                   signal: controller.signal,
-                  headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36',
-                    Accept: '*/*',
-                  },
+                  headers: reqHeaders,
                 });
                 if (res.status >= 300 && res.status < 400) {
                   const loc = res.headers.get('location');
@@ -234,7 +362,8 @@ jobs:
                 }
                 break;
               }
-              if (!res || !res.ok) throw new Error(`Remote server returned ${res ? res.status : 'no response'}`);
+              if (!res || !res.ok) throw new Error(`Remote server returned HTTP ${res ? res.status : 'no response'} for ${current.hostname}`);
+              if (!res.body) throw new Error(`Empty response body from ${current.hostname}`);
 
               const mime = (res.headers.get('content-type') || 'application/octet-stream').split(';')[0].trim().toLowerCase();
               const disp = res.headers.get('content-disposition');
@@ -257,10 +386,21 @@ jobs:
               }
 
               const buffer = Buffer.concat(chunks, total);
+              if (buffer.byteLength === 0) {
+                throw new Error(`Downloaded empty file (0 bytes) from ${current.hostname}`);
+              }
+
               if (allowEmbeddedRetry && mime === 'text/html') {
-                const embedded = extractEmbeddedMedia(current, buffer.subarray(0, 131072).toString('utf8'));
+                const embedded = extractEmbeddedMedia(current, buffer.subarray(0, 524288).toString('utf8'));
                 if (embedded) {
-                  return downloadFile(embedded, false);
+                  try {
+                    const extracted = await downloadFile(embedded, false, current.toString());
+                    if (extracted.mime !== 'text/html') {
+                      return extracted;
+                    }
+                  } catch (subErr) {
+                    console.warn('Embedded media retry failed:', subErr && subErr.message ? subErr.message : subErr);
+                  }
                 }
               }
 
@@ -287,6 +427,9 @@ jobs:
             const gmailPass = (process.env.GMAIL_APP_PASSWORD || '').replace(/[\s-]+/g, '').trim();
             const runUrl = process.env.RUN_URL || '';
 
+            if (!targetUrl) {
+              throw new Error('Missing TARGET_URL input');
+            }
             if (!gmailUser || !gmailPass) {
               throw new Error('Missing GMAIL_USER or GMAIL_APP_PASSWORD repository secrets');
             }
@@ -305,8 +448,10 @@ jobs:
                 throw new Error('Unsafe artifact path');
               }
               fs.writeFileSync(outPath, result.buffer);
-              fs.appendFileSync(process.env.GITHUB_OUTPUT, `has_artifact=true\nartifact_dir=${outDir}\n`);
-            } else {
+              if (process.env.GITHUB_OUTPUT) {
+                fs.appendFileSync(process.env.GITHUB_OUTPUT, `has_artifact=true\nartifact_dir=${outDir}\n`);
+              }
+            } else if (process.env.GITHUB_OUTPUT) {
               fs.appendFileSync(process.env.GITHUB_OUTPUT, `has_artifact=false\n`);
             }
 
@@ -353,8 +498,40 @@ jobs:
             console.log(`Sent ${finalName} (${sizeMb} MB) to ${to}`);
           }
 
-          main().catch((err) => {
+          main().catch(async (err) => {
+            const msg = (err && err.message ? String(err.message) : String(err)).replace(/[\r\n]+/g, ' ').slice(0, 500);
+            console.log(`::error title=Link2Mail Failure::${msg}`);
             console.error(err);
+
+            const gmailUser = (process.env.GMAIL_USER || '').trim();
+            const gmailPass = (process.env.GMAIL_APP_PASSWORD || '').replace(/[\s-]+/g, '').trim();
+            const to = (process.env.RECIPIENT_EMAIL || '').replace(/[\r\n]+/g, '').trim();
+            const targetUrl = (process.env.TARGET_URL || '').trim();
+            const runUrl = process.env.RUN_URL || '';
+
+            if (gmailUser && gmailPass && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to) && !/EAUTH|535|Username and Password not accepted/i.test(msg)) {
+              try {
+                const transporter = nodemailer.createTransport({
+                  host: 'smtp.gmail.com',
+                  port: 465,
+                  secure: true,
+                  auth: { user: gmailUser, pass: gmailPass },
+                });
+                await transporter.sendMail({
+                  from: gmailUser,
+                  to,
+                  subject: 'הורדת הקישור ב-GitHub נכשלה',
+                  text: [
+                    `לא ניתן היה להוריד או לשלוח את הקישור בשרתי GitHub:`,
+                    targetUrl,
+                    '',
+                    `פירוט השגיאה: ${msg}`,
+                    runUrl ? `\nקישור ליומן ההפעלה ב-GitHub:\n${runUrl}` : '',
+                  ].filter(Boolean).join('\n'),
+                });
+              } catch {}
+            }
+
             process.exit(1);
           });
           EOF
