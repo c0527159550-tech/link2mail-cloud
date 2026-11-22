@@ -1,0 +1,368 @@
+name: Link2Mail Cloud Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'File, Music, or Video URL to download outside NetFree'
+        required: true
+        type: string
+      to:
+        description: 'Destination email address'
+        required: true
+        type: string
+      subject:
+        description: 'Custom email subject (optional)'
+        required: false
+        default: ''
+        type: string
+      filename:
+        description: 'Custom attachment filename (optional)'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  download-and-email:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install nodemailer
+        run: |
+          mkdir -p /tmp/link2mail-worker
+          cd /tmp/link2mail-worker
+          npm init -y > /dev/null 2>&1
+          npm install --no-audit --no-fund nodemailer > /dev/null 2>&1
+
+      - name: Download URL in Cloud and Send via Gmail
+        id: worker
+        env:
+          TARGET_URL: ${{ github.event.inputs.url }}
+          RECIPIENT_EMAIL: ${{ github.event.inputs.to }}
+          CUSTOM_SUBJECT: ${{ github.event.inputs.subject }}
+          CUSTOM_FILENAME: ${{ github.event.inputs.filename }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          NODE_PATH=/tmp/link2mail-worker/node_modules node << 'EOF'
+          const dns = require('node:dns/promises');
+          const fs = require('node:fs');
+          const net = require('node:net');
+          const path = require('node:path');
+          const nodemailer = require('nodemailer');
+
+          const MAX_EMAIL_BYTES = 18 * 1024 * 1024;
+          const MAX_ARTIFACT_BYTES = 200 * 1024 * 1024;
+          const MAX_REDIRECTS = 6;
+          const FETCH_TIMEOUT_MS = 45000;
+
+          const MIME_TO_EXT = {
+            'application/pdf': '.pdf',
+            'image/jpeg': '.jpg',
+            'image/png': '.png',
+            'image/gif': '.gif',
+            'image/webp': '.webp',
+            'text/plain': '.txt',
+            'text/csv': '.csv',
+            'application/json': '.json',
+            'application/zip': '.zip',
+            'application/x-zip-compressed': '.zip',
+            'application/gzip': '.gz',
+            'audio/mpeg': '.mp3',
+            'audio/mp3': '.mp3',
+            'audio/wav': '.wav',
+            'audio/x-wav': '.wav',
+            'audio/ogg': '.ogg',
+            'audio/opus': '.opus',
+            'audio/aac': '.aac',
+            'audio/mp4': '.m4a',
+            'audio/x-m4a': '.m4a',
+            'audio/flac': '.flac',
+            'audio/x-flac': '.flac',
+            'audio/webm': '.weba',
+            'video/mp4': '.mp4',
+            'video/webm': '.webm',
+            'video/quicktime': '.mov',
+            'video/x-matroska': '.mkv',
+            'video/x-msvideo': '.avi',
+            'video/x-m4v': '.m4v',
+            'video/mpeg': '.mpeg',
+            'video/3gpp': '.3gp',
+            'video/ogg': '.ogv',
+          };
+
+          function isPublicIpv4(ip) {
+            const p = ip.split('.').map(Number);
+            if (p.length !== 4 || p.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return false;
+            const [a, b, c] = p;
+            if (a === 0 || a === 10 || a === 127 || a >= 224) return false;
+            if (a === 100 && b >= 64 && b <= 127) return false;
+            if (a === 169 && b === 254) return false;
+            if (a === 172 && b >= 16 && b <= 31) return false;
+            if (a === 192 && b === 168) return false;
+            if (a === 192 && b === 0 && (c === 0 || c === 2)) return false;
+            if (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) return false;
+            if (a === 203 && b === 0 && c === 113) return false;
+            return true;
+          }
+
+          function isPublicIp(ip) {
+            const norm = ip.trim().toLowerCase();
+            const v = net.isIP(norm);
+            if (v === 4) return isPublicIpv4(norm);
+            if (v === 6) {
+              if (norm === '::' || norm === '::1') return false;
+              if (norm.startsWith('::ffff:')) return isPublicIpv4(norm.slice(7));
+              const w = parseInt(norm.split(':')[0] || '', 16);
+              if (Number.isNaN(w)) return false;
+              if ((w & 0xfe00) === 0xfc00 || (w & 0xffc0) === 0xfe80 || (w & 0xff00) === 0xff00) return false;
+              return true;
+            }
+            return false;
+          }
+
+          async function validatePublicUrl(raw) {
+            const parsed = new URL(raw.trim());
+            if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+              throw new Error('Only HTTP/HTTPS URLs are allowed');
+            }
+            if (parsed.username || parsed.password) {
+              throw new Error('URLs with embedded credentials are not allowed');
+            }
+            const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+            if (!host || host === 'localhost' || host.endsWith('.local') || host.endsWith('.internal')) {
+              throw new Error('Private/local hosts are not allowed');
+            }
+            if (net.isIP(host)) {
+              if (!isPublicIp(host)) throw new Error('Private IP address blocked');
+              return parsed;
+            }
+            const records = await dns.lookup(host, { all: true });
+            if (!records.length || records.some((r) => !isPublicIp(r.address))) {
+              throw new Error('DNS resolved to non-public address');
+            }
+            return parsed;
+          }
+
+          function normalizeShareUrl(raw) {
+            const parsed = new URL(raw.trim());
+            const host = parsed.hostname.toLowerCase();
+            if (host === 'drive.google.com') {
+              const m = parsed.pathname.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
+              if (m) return `https://drive.google.com/uc?export=download&id=${m[1]}`;
+            }
+            if (host === 'www.dropbox.com' || host === 'dropbox.com') {
+              parsed.searchParams.set('dl', '1');
+              return parsed.toString();
+            }
+            if (host === 'github.com') {
+              const m = parsed.pathname.match(/^\/([^/]+)\/([^/]+)\/blob\/(.+)$/);
+              if (m) return `https://raw.githubusercontent.com/${m[1]}/${m[2]}/${m[3]}`;
+            }
+            return parsed.toString();
+          }
+
+          function sanitizeFilename(name) {
+            const base = path.basename(name).replace(/[\r\n\0<>:"/\\|?*]+/g, '_').replace(/^\.+/, '').trim();
+            return (base || 'downloaded-file').slice(0, 160);
+          }
+
+          function inferFilename(urlObj, disp, mime) {
+            if (disp) {
+              const u = disp.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
+              if (u && u[1]) {
+                try { return sanitizeFilename(decodeURIComponent(u[1].trim().replace(/^"|"$/g, ''))); } catch {}
+              }
+              const p = disp.match(/filename\s*=\s*"([^"]+)"/i) || disp.match(/filename\s*=\s*([^;]+)/i);
+              if (p && p[1]) return sanitizeFilename(p[1].trim().replace(/^"|"$/g, ''));
+            }
+            let seg = '';
+            try { seg = sanitizeFilename(decodeURIComponent(urlObj.pathname.split('/').filter(Boolean).pop() || '')); } catch {}
+            const ext = MIME_TO_EXT[mime] || '';
+            if (seg && seg !== 'uc' && seg !== 'download' && seg !== 'export') {
+              return !path.extname(seg) && ext ? `${seg}${ext}` : seg;
+            }
+            return `file-${Date.now()}${ext || '.bin'}`;
+          }
+
+          function extractEmbeddedMedia(baseUrl, html) {
+            const patterns = [
+              /<meta[^>]+property=["']og:video(?::secure_url|:url)?["'][^>]+content=["']([^"']+)["']/i,
+              /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:video(?::secure_url|:url)?["']/i,
+              /<meta[^>]+property=["']og:audio(?::secure_url|:url)?["'][^>]+content=["']([^"']+)["']/i,
+              /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:audio(?::secure_url|:url)?["']/i,
+              /<(?:video|audio|source)[^>]+src=["']([^"']+)["']/i,
+            ];
+            for (const rx of patterns) {
+              const m = html.match(rx);
+              if (!m || !m[1]) continue;
+              try {
+                const candidate = new URL(m[1].replace(/&amp;/g, '&'), baseUrl);
+                if (candidate.protocol === 'http:' || candidate.protocol === 'https:') return candidate.toString();
+              } catch {}
+            }
+            return null;
+          }
+
+          async function downloadFile(initialUrl, allowEmbeddedRetry = true) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+            try {
+              let current = await validatePublicUrl(normalizeShareUrl(initialUrl));
+              let res = null;
+              for (let i = 0; i <= MAX_REDIRECTS; i++) {
+                res = await fetch(current.toString(), {
+                  method: 'GET',
+                  redirect: 'manual',
+                  signal: controller.signal,
+                  headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36',
+                    Accept: '*/*',
+                  },
+                });
+                if (res.status >= 300 && res.status < 400) {
+                  const loc = res.headers.get('location');
+                  if (!loc) throw new Error('Redirect without location');
+                  current = await validatePublicUrl(new URL(loc, current).toString());
+                  continue;
+                }
+                break;
+              }
+              if (!res || !res.ok) throw new Error(`Remote server returned ${res ? res.status : 'no response'}`);
+
+              const mime = (res.headers.get('content-type') || 'application/octet-stream').split(';')[0].trim().toLowerCase();
+              const disp = res.headers.get('content-disposition');
+              const filename = inferFilename(current, disp, mime);
+              const reader = res.body.getReader();
+              const chunks = [];
+              let total = 0;
+
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (value) {
+                  total += value.byteLength;
+                  if (total > MAX_ARTIFACT_BYTES) {
+                    await reader.cancel();
+                    return { oversizeArtifact: true, tooLargeForEmail: true, buffer: Buffer.alloc(0), filename, mime, sizeBytes: total, resolvedUrl: current.toString() };
+                  }
+                  chunks.push(value);
+                }
+              }
+
+              const buffer = Buffer.concat(chunks, total);
+              if (allowEmbeddedRetry && mime === 'text/html') {
+                const embedded = extractEmbeddedMedia(current, buffer.subarray(0, 131072).toString('utf8'));
+                if (embedded) {
+                  return downloadFile(embedded, false);
+                }
+              }
+
+              return {
+                oversizeArtifact: false,
+                tooLargeForEmail: buffer.byteLength > MAX_EMAIL_BYTES,
+                buffer,
+                filename,
+                mime,
+                sizeBytes: buffer.byteLength,
+                resolvedUrl: current.toString(),
+              };
+            } finally {
+              clearTimeout(timer);
+            }
+          }
+
+          async function main() {
+            const targetUrl = (process.env.TARGET_URL || '').trim();
+            const to = (process.env.RECIPIENT_EMAIL || '').replace(/[\r\n]+/g, '').trim();
+            const customSubject = (process.env.CUSTOM_SUBJECT || '').replace(/[\r\n]+/g, ' ').trim();
+            const customFilename = (process.env.CUSTOM_FILENAME || '').trim();
+            const gmailUser = (process.env.GMAIL_USER || '').trim();
+            const gmailPass = (process.env.GMAIL_APP_PASSWORD || '').replace(/[\s-]+/g, '').trim();
+            const runUrl = process.env.RUN_URL || '';
+
+            if (!gmailUser || !gmailPass) {
+              throw new Error('Missing GMAIL_USER or GMAIL_APP_PASSWORD repository secrets');
+            }
+            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) {
+              throw new Error('Invalid recipient email');
+            }
+
+            const result = await downloadFile(targetUrl);
+            const finalName = customFilename ? sanitizeFilename(customFilename) : result.filename;
+            const outDir = '/tmp/link2mail-artifacts';
+            fs.mkdirSync(outDir, { recursive: true });
+
+            if (result.tooLargeForEmail && !result.oversizeArtifact) {
+              const outPath = path.resolve(outDir, finalName);
+              if (!outPath.startsWith(outDir + path.sep)) {
+                throw new Error('Unsafe artifact path');
+              }
+              fs.writeFileSync(outPath, result.buffer);
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, `has_artifact=true\nartifact_dir=${outDir}\n`);
+            } else {
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, `has_artifact=false\n`);
+            }
+
+            const transporter = nodemailer.createTransport({
+              host: 'smtp.gmail.com',
+              port: 465,
+              secure: true,
+              auth: { user: gmailUser, pass: gmailPass },
+            });
+
+            const subject = customSubject || (result.tooLargeForEmail ? `קישור/קובץ גדול מהענן: ${finalName}` : `קובץ מהענן: ${finalName}`);
+            const sizeMb = (result.sizeBytes / (1024 * 1024)).toFixed(2);
+
+            if (result.tooLargeForEmail) {
+              await transporter.sendMail({
+                from: gmailUser,
+                to,
+                subject,
+                text: [
+                  `הקובץ "${finalName}" (${sizeMb} MB, ${result.mime}) הורד בשרתי GitHub (מחוץ לסינון המקומי), אך הוא גדול ממגבלת הצרופה של Gmail (18 MB).`,
+                  '',
+                  `קישור ישיר לקובץ:`,
+                  result.resolvedUrl,
+                  '',
+                  !result.oversizeArtifact ? `ניתן גם להוריד את הקובץ ישירות מתוך GitHub Actions (Artifacts) בקישור:\n${runUrl}` : '',
+                ].filter(Boolean).join('\n'),
+              });
+            } else {
+              await transporter.sendMail({
+                from: gmailUser,
+                to,
+                subject,
+                text: `מצורף הקובץ "${finalName}" (${sizeMb} MB) שהורד בשרתי GitHub מחוץ לסינון המקומי מתוך:\n${result.resolvedUrl}`,
+                attachments: [
+                  {
+                    filename: finalName,
+                    content: result.buffer,
+                    contentType: result.mime,
+                  },
+                ],
+              });
+            }
+
+            console.log(`Sent ${finalName} (${sizeMb} MB) to ${to}`);
+          }
+
+          main().catch((err) => {
+            console.error(err);
+            process.exit(1);
+          });
+          EOF
+
+      - name: Upload Oversized Media as GitHub Artifact
+        if: steps.worker.outputs.has_artifact == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: link2mail-media
+          path: ${{ steps.worker.outputs.artifact_dir }}
+          retention-days: 7
