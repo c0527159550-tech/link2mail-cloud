@@ -639,43 +639,57 @@ jobs:
             const rawMeta = Array.isArray(data && data[0]) ? data[0] : [];
             const turns = Array.isArray(rawMeta[1]) ? rawMeta[1] : [];
 
-            const candidates = [];
+            const validAssets = [];
             const seenKeys = new Set();
+            let sawAnyCandidate = false;
+
             for (let t = turns.length - 1; t >= 0; t--) {
+              // Only inspect turns[t][3] (Gemini model output). turns[t][2] holds the user's prompt & uploaded images.
+              const modelResponseNode = Array.isArray(turns[t]) ? turns[t][3] : null;
+              if (!modelResponseNode) continue;
+
               const contribs = [];
               const images = [];
               const otherMedia = [];
-              collectUrlsFromGeminiTurn(turns[t], contribs, images, otherMedia, new Set());
-              for (const rawUrl of [...contribs, ...images, ...otherMedia]) {
+              collectUrlsFromGeminiTurn(modelResponseNode, contribs, images, otherMedia, new Set());
+
+              // If the turn produced downloadable files (e.g. PPTX/PDF), send those rather than inline helper PNG slices.
+              const turnUrls = contribs.length > 0 ? [...contribs, ...otherMedia] : [...images, ...otherMedia];
+              const turnPairs = [];
+              for (const rawUrl of turnUrls) {
                 const pair = upgradeGoogleImgUrl(rawUrl);
                 const key = pair.fallback || pair.primary;
                 if (seenKeys.has(key)) continue;
                 seenKeys.add(key);
-                candidates.push(pair);
+                turnPairs.push(pair);
               }
-            }
 
-            if (!candidates.length) {
-              throw new Error('No downloadable files or images found inside this Gemini share link');
-            }
+              if (!turnPairs.length) continue;
+              sawAnyCandidate = true;
 
-            const validAssets = [];
-            for (const pair of candidates.slice(0, 20)) {
-              if (validAssets.length >= 10) break;
-              const urlsToTry = pair.fallback ? [pair.primary, pair.fallback] : [pair.primary];
-              for (const u of urlsToTry) {
-                try {
-                  const downloaded = await downloadFile(u, false, 'https://gemini.google.com/');
-                  if (downloaded.mime !== 'text/html') {
-                    validAssets.push(downloaded);
-                    break;
-                  }
-                } catch {}
+              for (const pair of turnPairs.slice(0, 10)) {
+                if (validAssets.length >= 10) break;
+                const urlsToTry = pair.fallback ? [pair.primary, pair.fallback] : [pair.primary];
+                for (const u of urlsToTry) {
+                  try {
+                    const downloaded = await downloadFile(u, false, 'https://gemini.google.com/');
+                    if (downloaded.mime !== 'text/html') {
+                      validAssets.push(downloaded);
+                      break;
+                    }
+                  } catch {}
+                }
               }
+
+              // Stop once we have the generated output(s) from the newest active turn
+              if (validAssets.length > 0) break;
             }
 
+            if (!sawAnyCandidate) {
+              throw new Error('No generated files or images found inside this Gemini share link');
+            }
             if (!validAssets.length) {
-              throw new Error('Gemini share files or images returned HTTP 403/404 and are no longer publicly downloadable');
+              throw new Error('Gemini share generated files or images returned HTTP 403/404 and are no longer publicly downloadable');
             }
             return validAssets;
           }
