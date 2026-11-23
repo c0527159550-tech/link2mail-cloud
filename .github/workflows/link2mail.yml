@@ -25,7 +25,7 @@ on:
 jobs:
   download-and-email:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -61,10 +61,11 @@ jobs:
 
           const MAX_EMAIL_BYTES = 18 * 1024 * 1024;
           const MAX_MULTI_EMAIL_BYTES = 17 * 1024 * 1024;
-          const MAX_ARTIFACT_BYTES = 200 * 1024 * 1024;
+          const MAX_ARTIFACT_BYTES = 500 * 1024 * 1024;
           const MAX_HEADER_SIZE_BYTES = 131072;
           const MAX_REDIRECTS = 6;
-          const FETCH_TIMEOUT_MS = 45000;
+          const FETCH_TIMEOUT_MS = 300000;
+          const ARTIFACT_OUT_DIR = '/tmp/link2mail-artifacts';
 
           const MIME_TO_EXT = {
             'application/pdf': '.pdf',
@@ -177,10 +178,24 @@ jobs:
               let settled = false;
               let req = null;
               let activeRes = null;
+              let tempStream = null;
+              let tempFilePath = null;
+
+              const cleanupTemp = () => {
+                if (tempStream) {
+                  try { tempStream.destroy(); } catch {}
+                  tempStream = null;
+                }
+                if (tempFilePath) {
+                  try { if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); } catch {}
+                  tempFilePath = null;
+                }
+              };
 
               const timer = setTimeout(() => {
                 if (settled) return;
                 settled = true;
+                cleanupTemp();
                 const err = new Error('Request timed out');
                 err.name = 'AbortError';
                 err.code = 'ETIMEDOUT';
@@ -200,6 +215,7 @@ jobs:
                 if (settled) return;
                 settled = true;
                 clearTimeout(timer);
+                cleanupTemp();
                 reject(err);
               };
 
@@ -229,6 +245,7 @@ jobs:
                       status,
                       headers,
                       buffer: Buffer.alloc(0),
+                      tempFilePath: null,
                       finalUrl: targetUrl,
                       oversize: false,
                       declaredSize: Number.isNaN(declaredSize) ? 0 : declaredSize,
@@ -243,6 +260,7 @@ jobs:
                       status,
                       headers,
                       buffer: Buffer.alloc(0),
+                      tempFilePath: null,
                       finalUrl: targetUrl,
                       oversize: true,
                       declaredSize,
@@ -253,34 +271,87 @@ jobs:
                   const chunks = [];
                   let totalBytes = 0;
 
+                  const ensureTempStream = () => {
+                    if (tempStream) return;
+                    fs.mkdirSync(ARTIFACT_OUT_DIR, { recursive: true });
+                    tempFilePath = path.join(ARTIFACT_OUT_DIR, `_dl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.part`);
+                    tempStream = fs.createWriteStream(tempFilePath);
+                    tempStream.on('error', (err) => {
+                      if (res) res.destroy();
+                      finishReject(err);
+                    });
+                    for (const prevChunk of chunks) {
+                      tempStream.write(prevChunk);
+                    }
+                    chunks.length = 0;
+                  };
+
+                  if (options.allowDiskStream && !Number.isNaN(declaredSize) && declaredSize > MAX_EMAIL_BYTES) {
+                    ensureTempStream();
+                  }
+
                   res.on('data', (chunk) => {
                     if (settled) return;
                     totalBytes += chunk.byteLength;
                     if (totalBytes > options.maxBytes) {
                       res.destroy();
                       if (req) req.destroy();
+                      cleanupTemp();
                       finishResolve({
                         status,
                         headers,
                         buffer: Buffer.alloc(0),
+                        tempFilePath: null,
                         finalUrl: targetUrl,
                         oversize: true,
                         declaredSize: !Number.isNaN(declaredSize) ? declaredSize : totalBytes,
                       });
                       return;
                     }
-                    chunks.push(chunk);
+                    if (!tempStream && options.allowDiskStream && totalBytes > MAX_EMAIL_BYTES) {
+                      ensureTempStream();
+                    }
+                    if (tempStream) {
+                      const canContinue = tempStream.write(chunk);
+                      if (!canContinue) res.pause();
+                      if (!tempStream.listenerCount('drain')) {
+                        tempStream.once('drain', () => {
+                          if (!settled && activeRes) activeRes.resume();
+                        });
+                      }
+                    } else {
+                      chunks.push(chunk);
+                    }
                   });
 
                   res.on('end', () => {
-                    finishResolve({
-                      status,
-                      headers,
-                      buffer: Buffer.concat(chunks, totalBytes),
-                      finalUrl: targetUrl,
-                      oversize: false,
-                      declaredSize: !Number.isNaN(declaredSize) ? declaredSize : totalBytes,
-                    });
+                    if (settled) return;
+                    const finalSize = !Number.isNaN(declaredSize) && declaredSize > 0 ? Math.max(declaredSize, totalBytes) : totalBytes;
+                    if (tempStream) {
+                      const savedPath = tempFilePath;
+                      tempStream.end(() => {
+                        tempStream = null;
+                        finishResolve({
+                          status,
+                          headers,
+                          buffer: Buffer.alloc(0),
+                          tempFilePath: savedPath,
+                          finalUrl: targetUrl,
+                          oversize: false,
+                          declaredSize: finalSize,
+                        });
+                      });
+                    } else {
+                      finishResolve({
+                        status,
+                        headers,
+                        buffer: Buffer.concat(chunks, totalBytes),
+                        tempFilePath: null,
+                        finalUrl: targetUrl,
+                        oversize: false,
+                        declaredSize: finalSize,
+                      });
+                    }
                   });
 
                   res.on('error', finishReject);
@@ -312,6 +383,7 @@ jobs:
                 maxBytes,
                 timeoutMs,
                 probeOnly: Boolean(options.probeOnly),
+                allowDiskStream: Boolean(options.allowDiskStream),
               });
               if (res.status >= 300 && res.status < 400) {
                 const loc = res.headers.location;
@@ -707,10 +779,14 @@ jobs:
               maxBytes: MAX_ARTIFACT_BYTES,
               timeoutMs: FETCH_TIMEOUT_MS,
               maxRedirects: MAX_REDIRECTS,
+              allowDiskStream: true,
               headers: reqHeaders,
             });
 
             if (res.status < 200 || res.status >= 300) {
+              if (res.tempFilePath && fs.existsSync(res.tempFilePath)) {
+                try { fs.unlinkSync(res.tempFilePath); } catch {}
+              }
               throw new Error(`Remote server returned HTTP ${res.status} for ${res.finalUrl.hostname}`);
             }
 
@@ -723,6 +799,7 @@ jobs:
                 oversizeArtifact: true,
                 tooLargeForEmail: true,
                 buffer: Buffer.alloc(0),
+                tempFilePath: null,
                 filename,
                 mime,
                 sizeBytes: res.declaredSize,
@@ -730,11 +807,15 @@ jobs:
               };
             }
 
-            if (res.buffer.byteLength === 0) {
+            const actualSize = res.tempFilePath ? res.declaredSize : res.buffer.byteLength;
+            if (actualSize === 0) {
+              if (res.tempFilePath && fs.existsSync(res.tempFilePath)) {
+                try { fs.unlinkSync(res.tempFilePath); } catch {}
+              }
               throw new Error(`Downloaded empty file (0 bytes) from ${res.finalUrl.hostname}`);
             }
 
-            if (allowEmbeddedRetry && mime === 'text/html') {
+            if (allowEmbeddedRetry && mime === 'text/html' && !res.tempFilePath) {
               const embedded = extractEmbeddedMedia(res.finalUrl, res.buffer.subarray(0, 524288).toString('utf8'));
               if (embedded) {
                 try {
@@ -750,11 +831,12 @@ jobs:
 
             return {
               oversizeArtifact: false,
-              tooLargeForEmail: res.buffer.byteLength > MAX_EMAIL_BYTES,
+              tooLargeForEmail: actualSize > MAX_EMAIL_BYTES || Boolean(res.tempFilePath),
               buffer: res.buffer,
+              tempFilePath: res.tempFilePath || null,
               filename,
               mime,
-              sizeBytes: res.buffer.byteLength,
+              sizeBytes: actualSize,
               resolvedUrl: res.finalUrl.toString(),
             };
           }
@@ -786,7 +868,7 @@ jobs:
               auth: { user: gmailUser, pass: gmailPass },
             });
 
-            const outDir = '/tmp/link2mail-artifacts';
+            const outDir = ARTIFACT_OUT_DIR;
             fs.mkdirSync(outDir, { recursive: true });
             let hasArtifact = false;
 
@@ -807,7 +889,7 @@ jobs:
                 }
                 usedNames.add(name);
 
-                if (!asset.oversizeArtifact && !asset.tooLargeForEmail && attachedBytes + asset.sizeBytes <= MAX_MULTI_EMAIL_BYTES) {
+                if (!asset.oversizeArtifact && !asset.tooLargeForEmail && !asset.tempFilePath && attachedBytes + asset.sizeBytes <= MAX_MULTI_EMAIL_BYTES) {
                   attachments.push({ filename: name, content: asset.buffer, contentType: asset.mime });
                   attachedBytes += asset.sizeBytes;
                 } else {
@@ -815,7 +897,11 @@ jobs:
                   if (!asset.oversizeArtifact) {
                     const outPath = path.resolve(outDir, name);
                     if (!outPath.startsWith(outDir + path.sep)) throw new Error('Unsafe artifact path');
-                    fs.writeFileSync(outPath, asset.buffer);
+                    if (asset.tempFilePath && fs.existsSync(asset.tempFilePath)) {
+                      fs.renameSync(asset.tempFilePath, outPath);
+                    } else {
+                      fs.writeFileSync(outPath, asset.buffer);
+                    }
                     hasArtifact = true;
                   }
                 }
@@ -834,7 +920,7 @@ jobs:
                 '',
                 attachments.length ? `מצורפים למייל ${attachments.length} קבצים (${totalMb} MB סה"כ).` : '',
                 overflowLinks.length ? `\nקבצים נוספים שחרגו ממגבלת הצרופה (זמינים בקישורים הבאים):\n${overflowLinks.join('\n')}` : '',
-                hasArtifact && runUrl ? `\nניתן להוריד קבצים נוספים מ-GitHub Artifacts:\n${runUrl}` : '',
+                hasArtifact && runUrl ? `\nניתן להוריד קבצים/וידיאו גדולים (עד 500 MB) ישירות מ-GitHub Artifacts בקישור:\n${runUrl}` : '',
               ].filter(Boolean);
 
               await transporter.sendMail({
@@ -856,7 +942,11 @@ jobs:
               if (!outPath.startsWith(outDir + path.sep)) {
                 throw new Error('Unsafe artifact path');
               }
-              fs.writeFileSync(outPath, result.buffer);
+              if (result.tempFilePath && fs.existsSync(result.tempFilePath)) {
+                fs.renameSync(result.tempFilePath, outPath);
+              } else {
+                fs.writeFileSync(outPath, result.buffer);
+              }
               hasArtifact = true;
             }
 
@@ -878,7 +968,7 @@ jobs:
                   `קישור ישיר לקובץ:`,
                   result.resolvedUrl,
                   '',
-                  !result.oversizeArtifact ? `ניתן גם להוריד את הקובץ ישירות מתוך GitHub Actions (Artifacts) בקישור:\n${runUrl}` : '',
+                  !result.oversizeArtifact ? `הקובץ/הווידיאו (עד 500 MB) זמין להורדה מלאה ב-GitHub Actions Artifacts בקישור:\n${runUrl}` : '',
                 ].filter(Boolean).join('\n'),
               });
             } else {
