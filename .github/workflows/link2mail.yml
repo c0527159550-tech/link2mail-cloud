@@ -25,7 +25,7 @@ on:
 jobs:
   download-and-email:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -61,10 +61,10 @@ jobs:
 
           const MAX_EMAIL_BYTES = 18 * 1024 * 1024;
           const MAX_MULTI_EMAIL_BYTES = 17 * 1024 * 1024;
-          const MAX_ARTIFACT_BYTES = 500 * 1024 * 1024;
+          const MAX_ARTIFACT_BYTES = 2 * 1024 * 1024 * 1024;
           const MAX_HEADER_SIZE_BYTES = 131072;
           const MAX_REDIRECTS = 6;
-          const FETCH_TIMEOUT_MS = 300000;
+          const FETCH_TIMEOUT_MS = 900000;
           const ARTIFACT_OUT_DIR = '/tmp/link2mail-artifacts';
 
           const MIME_TO_EXT = {
@@ -410,11 +410,20 @@ jobs:
             const parsed = new URL(raw.trim());
             const host = parsed.hostname.toLowerCase();
             if (host === 'drive.google.com') {
+              const resourceKey = parsed.searchParams.get('resourcekey');
+              const buildDriveUrl = (fileId) => {
+                const target = new URL('https://drive.usercontent.google.com/download');
+                target.searchParams.set('id', fileId);
+                target.searchParams.set('export', 'download');
+                target.searchParams.set('confirm', 't');
+                if (resourceKey) target.searchParams.set('resourcekey', resourceKey);
+                return target.toString();
+              };
               const m = parsed.pathname.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
-              if (m) return `https://drive.google.com/uc?export=download&id=${m[1]}`;
-              const openId = parsed.searchParams.get('id');
-              if (parsed.pathname === '/open' && openId && /^[a-zA-Z0-9_-]+$/.test(openId)) {
-                return `https://drive.google.com/uc?export=download&id=${openId}`;
+              if (m) return buildDriveUrl(m[1]);
+              const paramId = parsed.searchParams.get('id');
+              if ((parsed.pathname === '/open' || parsed.pathname === '/uc') && paramId && /^[a-zA-Z0-9_-]+$/.test(paramId)) {
+                return buildDriveUrl(paramId);
               }
             }
             if (host === 'docs.google.com') {
@@ -441,6 +450,15 @@ jobs:
             return (base || 'downloaded-file').slice(0, 160);
           }
 
+          function decodeHttpHeaderUtf8(val) {
+            if (!/[\u0080-\u00ff]/.test(val)) return val;
+            try {
+              const decoded = Buffer.from(val, 'latin1').toString('utf8');
+              if (!decoded.includes('\ufffd')) return decoded;
+            } catch {}
+            return val;
+          }
+
           function inferFilename(urlObj, disp, mime) {
             if (disp) {
               const u = disp.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
@@ -448,7 +466,7 @@ jobs:
                 try { return sanitizeFilename(decodeURIComponent(u[1].trim().replace(/^"|"$/g, ''))); } catch {}
               }
               const p = disp.match(/filename\s*=\s*"([^"]+)"/i) || disp.match(/filename\s*=\s*([^;]+)/i);
-              if (p && p[1]) return sanitizeFilename(p[1].trim().replace(/^"|"$/g, ''));
+              if (p && p[1]) return sanitizeFilename(decodeHttpHeaderUtf8(p[1].trim().replace(/^"|"$/g, '')));
             }
             let seg = '';
             try { seg = sanitizeFilename(decodeURIComponent(urlObj.pathname.split('/').filter(Boolean).pop() || '')); } catch {}
@@ -513,6 +531,25 @@ jobs:
           }
 
           function extractEmbeddedMedia(baseUrl, html) {
+            const driveFormMatch = html.match(/<form\b[^>]*\bid=["']?download-form["']?[^>]*>([\s\S]*?)<\/form>/i);
+            if (driveFormMatch) {
+              const formTag = (driveFormMatch[0].match(/<form\b[^>]*>/i) || [])[0] || '';
+              const resolvedAction = resolveHttpUrl(baseUrl, getHtmlAttr(formTag, 'action'));
+              if (resolvedAction) {
+                try {
+                  const confirmUrl = new URL(resolvedAction);
+                  const inputTags = driveFormMatch[1].match(/<input\b[^>]*>/gi) || [];
+                  for (const inputTag of inputTags) {
+                    const name = getHtmlAttr(inputTag, 'name');
+                    const value = getHtmlAttr(inputTag, 'value') || '';
+                    if (name) confirmUrl.searchParams.set(name, value);
+                  }
+                  if (!confirmUrl.searchParams.has('confirm')) confirmUrl.searchParams.set('confirm', 't');
+                  return confirmUrl.toString();
+                } catch {}
+              }
+            }
+
             const metaTags = html.match(/<meta\b[^>]*>/gi) || [];
             const mediaMeta = new Set(['og:video:secure_url', 'og:video:url', 'og:video', 'twitter:player:stream', 'og:audio:secure_url', 'og:audio:url', 'og:audio']);
             for (const tag of metaTags) {
@@ -920,7 +957,7 @@ jobs:
                 '',
                 attachments.length ? `מצורפים למייל ${attachments.length} קבצים (${totalMb} MB סה"כ).` : '',
                 overflowLinks.length ? `\nקבצים נוספים שחרגו ממגבלת הצרופה (זמינים בקישורים הבאים):\n${overflowLinks.join('\n')}` : '',
-                hasArtifact && runUrl ? `\nניתן להוריד קבצים/וידיאו גדולים (עד 500 MB) ישירות מ-GitHub Artifacts בקישור:\n${runUrl}` : '',
+                hasArtifact && runUrl ? `\nניתן להוריד קבצים/וידיאו גדולים (עד 2 GB) ישירות מ-GitHub Artifacts בקישור:\n${runUrl}` : '',
               ].filter(Boolean);
 
               await transporter.sendMail({
@@ -968,7 +1005,7 @@ jobs:
                   `קישור ישיר לקובץ:`,
                   result.resolvedUrl,
                   '',
-                  !result.oversizeArtifact ? `הקובץ/הווידיאו (עד 500 MB) זמין להורדה מלאה ב-GitHub Actions Artifacts בקישור:\n${runUrl}` : '',
+                  !result.oversizeArtifact ? `הקובץ/הווידיאו (עד 2 GB) זמין להורדה מלאה ב-GitHub Actions Artifacts בקישור:\n${runUrl}` : '',
                 ].filter(Boolean).join('\n'),
               });
             } else {
