@@ -53,17 +53,27 @@ jobs:
           NODE_PATH=/tmp/link2mail-worker/node_modules node << 'EOF'
           const dns = require('node:dns/promises');
           const fs = require('node:fs');
+          const http = require('node:http');
+          const https = require('node:https');
           const net = require('node:net');
           const path = require('node:path');
           const nodemailer = require('nodemailer');
 
           const MAX_EMAIL_BYTES = 18 * 1024 * 1024;
+          const MAX_MULTI_EMAIL_BYTES = 17 * 1024 * 1024;
           const MAX_ARTIFACT_BYTES = 200 * 1024 * 1024;
+          const MAX_HEADER_SIZE_BYTES = 131072;
           const MAX_REDIRECTS = 6;
           const FETCH_TIMEOUT_MS = 45000;
 
           const MIME_TO_EXT = {
             'application/pdf': '.pdf',
+            'application/msword': '.doc',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+            'application/vnd.ms-excel': '.xls',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+            'application/vnd.ms-powerpoint': '.ppt',
+            'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
             'image/jpeg': '.jpg',
             'image/png': '.png',
             'image/gif': '.gif',
@@ -138,7 +148,7 @@ jobs:
               throw new Error('URLs with embedded credentials are not allowed');
             }
             const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
-            if (!host || host === 'localhost' || host.endsWith('.local') || host.endsWith('.internal')) {
+            if (!host || host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) {
               throw new Error('Private/local hosts are not allowed');
             }
             if (net.isIP(host)) {
@@ -150,6 +160,178 @@ jobs:
               throw new Error('DNS resolved to non-public address');
             }
             return parsed;
+          }
+
+          function normalizeIncomingHeaders(rawHeaders) {
+            const out = {};
+            for (const [key, val] of Object.entries(rawHeaders)) {
+              if (val === undefined) continue;
+              out[key.toLowerCase()] = Array.isArray(val) ? val.join(', ') : val;
+            }
+            return out;
+          }
+
+          function sendSingleHttpRequest(targetUrl, options) {
+            return new Promise((resolve, reject) => {
+              const transport = targetUrl.protocol === 'https:' ? https : http;
+              let settled = false;
+              let req = null;
+              let activeRes = null;
+
+              const timer = setTimeout(() => {
+                if (settled) return;
+                settled = true;
+                const err = new Error('Request timed out');
+                err.name = 'AbortError';
+                err.code = 'ETIMEDOUT';
+                if (req) req.destroy();
+                if (activeRes) activeRes.destroy();
+                reject(err);
+              }, options.timeoutMs);
+
+              const finishResolve = (result) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                resolve(result);
+              };
+
+              const finishReject = (err) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                reject(err);
+              };
+
+              const reqHeaders = Object.assign({ 'Accept-Encoding': 'identity' }, options.headers || {});
+              if (options.body !== undefined) {
+                reqHeaders['Content-Length'] = String(Buffer.byteLength(options.body, 'utf8'));
+              }
+
+              req = transport.request(
+                targetUrl,
+                {
+                  method: options.method || 'GET',
+                  headers: reqHeaders,
+                  maxHeaderSize: MAX_HEADER_SIZE_BYTES,
+                },
+                (res) => {
+                  activeRes = res;
+                  const status = res.statusCode || 0;
+                  const headers = normalizeIncomingHeaders(res.headers);
+                  const rawLen = headers['content-length'];
+                  const declaredSize = rawLen ? Number(rawLen) : NaN;
+
+                  if ((status >= 300 && status < 400) || options.probeOnly || options.method === 'HEAD') {
+                    res.resume();
+                    res.destroy();
+                    finishResolve({
+                      status,
+                      headers,
+                      buffer: Buffer.alloc(0),
+                      finalUrl: targetUrl,
+                      oversize: false,
+                      declaredSize: Number.isNaN(declaredSize) ? 0 : declaredSize,
+                    });
+                    return;
+                  }
+
+                  if (!Number.isNaN(declaredSize) && declaredSize > options.maxBytes) {
+                    res.destroy();
+                    if (req) req.destroy();
+                    finishResolve({
+                      status,
+                      headers,
+                      buffer: Buffer.alloc(0),
+                      finalUrl: targetUrl,
+                      oversize: true,
+                      declaredSize,
+                    });
+                    return;
+                  }
+
+                  const chunks = [];
+                  let totalBytes = 0;
+
+                  res.on('data', (chunk) => {
+                    if (settled) return;
+                    totalBytes += chunk.byteLength;
+                    if (totalBytes > options.maxBytes) {
+                      res.destroy();
+                      if (req) req.destroy();
+                      finishResolve({
+                        status,
+                        headers,
+                        buffer: Buffer.alloc(0),
+                        finalUrl: targetUrl,
+                        oversize: true,
+                        declaredSize: !Number.isNaN(declaredSize) ? declaredSize : totalBytes,
+                      });
+                      return;
+                    }
+                    chunks.push(chunk);
+                  });
+
+                  res.on('end', () => {
+                    finishResolve({
+                      status,
+                      headers,
+                      buffer: Buffer.concat(chunks, totalBytes),
+                      finalUrl: targetUrl,
+                      oversize: false,
+                      declaredSize: !Number.isNaN(declaredSize) ? declaredSize : totalBytes,
+                    });
+                  });
+
+                  res.on('error', finishReject);
+                }
+              );
+
+              req.on('error', finishReject);
+              if (options.body !== undefined) req.write(options.body, 'utf8');
+              req.end();
+            });
+          }
+
+          async function httpRequestWithLargeHeaders(initialUrl, options = {}) {
+            const method = options.method || 'GET';
+            const maxBytes = options.maxBytes || MAX_ARTIFACT_BYTES;
+            const timeoutMs = options.timeoutMs || FETCH_TIMEOUT_MS;
+            const maxRedirects = options.maxRedirects || MAX_REDIRECTS;
+            const headers = options.headers || {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+              Accept: '*/*',
+            };
+
+            let current = await validatePublicUrl(initialUrl);
+            for (let i = 0; i <= maxRedirects; i++) {
+              const res = await sendSingleHttpRequest(current, {
+                method: i === 0 ? method : method === 'POST' ? 'GET' : method,
+                headers,
+                body: i === 0 ? options.body : undefined,
+                maxBytes,
+                timeoutMs,
+                probeOnly: Boolean(options.probeOnly),
+              });
+              if (res.status >= 300 && res.status < 400) {
+                const loc = res.headers.location;
+                if (!loc) throw new Error('Redirect without location');
+                current = await validatePublicUrl(new URL(loc, current).toString());
+                if (options.stopOnRedirectMatch && options.stopOnRedirectMatch(current)) {
+                  return {
+                    status: res.status,
+                    headers: res.headers,
+                    buffer: Buffer.alloc(0),
+                    finalUrl: current,
+                    oversize: false,
+                    declaredSize: 0,
+                  };
+                }
+                continue;
+              }
+              return res;
+            }
+            throw new Error('Too many HTTP redirects');
           }
 
           function normalizeShareUrl(raw) {
@@ -333,89 +515,234 @@ jobs:
             return bestUrl;
           }
 
-          async function downloadFile(initialUrl, allowEmbeddedRetry = true, refererUrl = '') {
-            const controller = new AbortController();
-            const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+          function isGeminiShareUrl(parsedUrl) {
+            const host = parsedUrl.hostname.toLowerCase();
+            if (host === 'share.gemini.google' && parsedUrl.pathname.replace(/\//g, '').length > 0) return true;
+            if (host === 'gemini.google.com' && /^\/share\/[a-zA-Z0-9_-]{4,80}/.test(parsedUrl.pathname)) return true;
+            return false;
+          }
+
+          function upgradeGoogleImgUrl(rawUrl) {
             try {
-              let current = await validatePublicUrl(normalizeShareUrl(initialUrl));
-              let res = null;
-              for (let i = 0; i <= MAX_REDIRECTS; i++) {
-                const reqHeaders = {
-                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-                  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,audio/*,video/*,*/*;q=0.8',
-                  'Accept-Language': 'he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7',
-                };
-                if (refererUrl) {
-                  reqHeaders.Referer = refererUrl;
+              const parsed = new URL(rawUrl);
+              if (/^(?:lh\d+|geo\d+)\.googleusercontent\.com$/i.test(parsed.hostname) && /\/(?:gg|rd-gg)\//.test(parsed.pathname)) {
+                if (!/=[a-zA-Z0-9_-]+$/.test(parsed.pathname)) {
+                  const full = new URL(parsed.toString());
+                  full.pathname = parsed.pathname + '=s0';
+                  return { primary: full.toString(), fallback: parsed.toString() };
                 }
-                res = await fetch(current.toString(), {
-                  method: 'GET',
-                  redirect: 'manual',
-                  signal: controller.signal,
-                  headers: reqHeaders,
-                });
-                if (res.status >= 300 && res.status < 400) {
-                  const loc = res.headers.get('location');
-                  if (!loc) throw new Error('Redirect without location');
-                  current = await validatePublicUrl(new URL(loc, current).toString());
-                  continue;
-                }
-                break;
               }
-              if (!res || !res.ok) throw new Error(`Remote server returned HTTP ${res ? res.status : 'no response'} for ${current.hostname}`);
-              if (!res.body) throw new Error(`Empty response body from ${current.hostname}`);
+            } catch {}
+            return { primary: rawUrl, fallback: null };
+          }
 
-              const mime = (res.headers.get('content-type') || 'application/octet-stream').split(';')[0].trim().toLowerCase();
-              const disp = res.headers.get('content-disposition');
-              const filename = inferFilename(current, disp, mime);
-              const reader = res.body.getReader();
-              const chunks = [];
-              let total = 0;
-
-              while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                if (value) {
-                  total += value.byteLength;
-                  if (total > MAX_ARTIFACT_BYTES) {
-                    await reader.cancel();
-                    return { oversizeArtifact: true, tooLargeForEmail: true, buffer: Buffer.alloc(0), filename, mime, sizeBytes: total, resolvedUrl: current.toString() };
+          function collectUrlsFromGeminiTurn(node, contribs, images, otherMedia, seenRaw, depth = 0) {
+            if (depth > 30 || node === null || node === undefined) return;
+            if (typeof node === 'string') {
+              if (node.startsWith('https://')) {
+                const cleaned = node.trim();
+                if (seenRaw.has(cleaned)) return;
+                seenRaw.add(cleaned);
+                try {
+                  const u = new URL(cleaned);
+                  const host = u.hostname.toLowerCase();
+                  if (host === 'contribution.usercontent.google.com' && u.pathname.startsWith('/download')) {
+                    contribs.push(cleaned);
+                  } else if (/^(?:lh\d+|geo\d+)\.googleusercontent\.com$/i.test(host) && /\/(?:gg|rd-gg)\//.test(u.pathname)) {
+                    images.push(cleaned);
+                  } else if (
+                    !host.endsWith('gstatic.com') &&
+                    host !== 'fonts.googleapis.com' &&
+                    host !== 'gemini.google.com' &&
+                    !u.pathname.startsWith('/a/') &&
+                    /\.(?:mp4|webm|mov|mkv|mp3|wav|m4a|ogg|flac|pdf|pptx|docx|xlsx|zip|png|jpe?g|webp|gif)(?:$|\?)/i.test(u.pathname)
+                  ) {
+                    otherMedia.push(cleaned);
                   }
-                  chunks.push(value);
-                }
+                } catch {}
               }
+              return;
+            }
+            if (Array.isArray(node)) {
+              for (let i = 0; i < node.length; i++) collectUrlsFromGeminiTurn(node[i], contribs, images, otherMedia, seenRaw, depth + 1);
+              return;
+            }
+            if (typeof node === 'object') {
+              for (const val of Object.values(node)) collectUrlsFromGeminiTurn(val, contribs, images, otherMedia, seenRaw, depth + 1);
+            }
+          }
 
-              const buffer = Buffer.concat(chunks, total);
-              if (buffer.byteLength === 0) {
-                throw new Error(`Downloaded empty file (0 bytes) from ${current.hostname}`);
-              }
+          async function resolveGeminiShareUrls(initialUrl) {
+            let sharePageUrl = initialUrl;
+            if (initialUrl.hostname.toLowerCase() === 'share.gemini.google') {
+              const r = await httpRequestWithLargeHeaders(initialUrl.toString(), {
+                method: 'GET',
+                maxBytes: 262144,
+                stopOnRedirectMatch: (nextUrl) =>
+                  nextUrl.hostname.toLowerCase() === 'gemini.google.com' && /\/share\/[a-zA-Z0-9_-]{4,80}/.test(nextUrl.pathname),
+              });
+              sharePageUrl = r.finalUrl;
+            }
 
-              if (allowEmbeddedRetry && mime === 'text/html') {
-                const embedded = extractEmbeddedMedia(current, buffer.subarray(0, 524288).toString('utf8'));
-                if (embedded) {
-                  try {
-                    const extracted = await downloadFile(embedded, false, current.toString());
-                    if (extracted.mime !== 'text/html') {
-                      return extracted;
+            if (sharePageUrl.hostname.toLowerCase() !== 'gemini.google.com') {
+              throw new Error('Gemini share link did not redirect to gemini.google.com');
+            }
+            const m = sharePageUrl.pathname.match(/\/share\/([a-zA-Z0-9_-]{4,80})/);
+            if (!m || !m[1]) throw new Error('Could not parse Gemini share ID');
+            const shareId = m[1];
+
+            const batchUrl = `https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids=ujx1Bf&source-path=${encodeURIComponent('/share/' + shareId)}&hl=en&rt=c`;
+            const fReq = JSON.stringify([[['ujx1Bf', JSON.stringify([null, shareId, [4]]), null, 'generic']]]);
+            const batchRes = await httpRequestWithLargeHeaders(batchUrl, {
+              method: 'POST',
+              maxBytes: 8 * 1024 * 1024,
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+                'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                Accept: '*/*',
+                'X-Same-Domain': '1',
+                Origin: 'https://gemini.google.com',
+                Referer: `https://gemini.google.com/share/${shareId}`,
+                Cookie: 'SOCS=CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg',
+              },
+              body: 'f.req=' + encodeURIComponent(fReq),
+            });
+
+            if (batchRes.status < 200 || batchRes.status >= 300) {
+              throw new Error(`Gemini share API returned HTTP ${batchRes.status}`);
+            }
+
+            const rawText = batchRes.buffer.toString('utf8');
+            let payloadStr = null;
+            for (const line of rawText.split(/\r?\n/)) {
+              const trimmed = line.trim();
+              if (!trimmed.startsWith('[')) continue;
+              try {
+                const parsed = JSON.parse(trimmed);
+                if (Array.isArray(parsed)) {
+                  for (const item of parsed) {
+                    if (Array.isArray(item) && item[0] === 'wrb.fr' && item[1] === 'ujx1Bf' && typeof item[2] === 'string') {
+                      payloadStr = item[2];
+                      break;
                     }
-                  } catch (subErr) {
-                    console.warn('Embedded media retry failed:', subErr && subErr.message ? subErr.message : subErr);
                   }
                 }
-              }
+                if (payloadStr) break;
+              } catch {}
+            }
 
+            if (!payloadStr) {
+              throw new Error('Gemini share payload is empty or private');
+            }
+
+            const data = JSON.parse(payloadStr);
+            const rawMeta = Array.isArray(data && data[0]) ? data[0] : [];
+            const turns = Array.isArray(rawMeta[1]) ? rawMeta[1] : [];
+
+            const candidates = [];
+            const seenKeys = new Set();
+            for (let t = turns.length - 1; t >= 0; t--) {
+              const contribs = [];
+              const images = [];
+              const otherMedia = [];
+              collectUrlsFromGeminiTurn(turns[t], contribs, images, otherMedia, new Set());
+              for (const rawUrl of [...contribs, ...images, ...otherMedia]) {
+                const pair = upgradeGoogleImgUrl(rawUrl);
+                const key = pair.fallback || pair.primary;
+                if (seenKeys.has(key)) continue;
+                seenKeys.add(key);
+                candidates.push(pair);
+              }
+            }
+
+            if (!candidates.length) {
+              throw new Error('No downloadable files or images found inside this Gemini share link');
+            }
+
+            const validAssets = [];
+            for (const pair of candidates.slice(0, 20)) {
+              if (validAssets.length >= 10) break;
+              const urlsToTry = pair.fallback ? [pair.primary, pair.fallback] : [pair.primary];
+              for (const u of urlsToTry) {
+                try {
+                  const downloaded = await downloadFile(u, false, 'https://gemini.google.com/');
+                  if (downloaded.mime !== 'text/html') {
+                    validAssets.push(downloaded);
+                    break;
+                  }
+                } catch {}
+              }
+            }
+
+            if (!validAssets.length) {
+              throw new Error('Gemini share files or images returned HTTP 403/404 and are no longer publicly downloadable');
+            }
+            return validAssets;
+          }
+
+          async function downloadFile(initialUrl, allowEmbeddedRetry = true, refererUrl = '') {
+            const reqHeaders = {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+              Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,audio/*,video/*,*/*;q=0.8',
+              'Accept-Language': 'he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7',
+            };
+            if (refererUrl) reqHeaders.Referer = refererUrl;
+
+            const res = await httpRequestWithLargeHeaders(normalizeShareUrl(initialUrl), {
+              method: 'GET',
+              maxBytes: MAX_ARTIFACT_BYTES,
+              timeoutMs: FETCH_TIMEOUT_MS,
+              maxRedirects: MAX_REDIRECTS,
+              headers: reqHeaders,
+            });
+
+            if (res.status < 200 || res.status >= 300) {
+              throw new Error(`Remote server returned HTTP ${res.status} for ${res.finalUrl.hostname}`);
+            }
+
+            const mime = (res.headers['content-type'] || 'application/octet-stream').split(';')[0].trim().toLowerCase();
+            const disp = res.headers['content-disposition'] || null;
+            const filename = inferFilename(res.finalUrl, disp, mime);
+
+            if (res.oversize) {
               return {
-                oversizeArtifact: false,
-                tooLargeForEmail: buffer.byteLength > MAX_EMAIL_BYTES,
-                buffer,
+                oversizeArtifact: true,
+                tooLargeForEmail: true,
+                buffer: Buffer.alloc(0),
                 filename,
                 mime,
-                sizeBytes: buffer.byteLength,
-                resolvedUrl: current.toString(),
+                sizeBytes: res.declaredSize,
+                resolvedUrl: res.finalUrl.toString(),
               };
-            } finally {
-              clearTimeout(timer);
             }
+
+            if (res.buffer.byteLength === 0) {
+              throw new Error(`Downloaded empty file (0 bytes) from ${res.finalUrl.hostname}`);
+            }
+
+            if (allowEmbeddedRetry && mime === 'text/html') {
+              const embedded = extractEmbeddedMedia(res.finalUrl, res.buffer.subarray(0, 524288).toString('utf8'));
+              if (embedded) {
+                try {
+                  const extracted = await downloadFile(embedded, false, res.finalUrl.toString());
+                  if (extracted.mime !== 'text/html') {
+                    return extracted;
+                  }
+                } catch (subErr) {
+                  console.warn('Embedded media retry failed:', subErr && subErr.message ? subErr.message : subErr);
+                }
+              }
+            }
+
+            return {
+              oversizeArtifact: false,
+              tooLargeForEmail: res.buffer.byteLength > MAX_EMAIL_BYTES,
+              buffer: res.buffer,
+              filename,
+              mime,
+              sizeBytes: res.buffer.byteLength,
+              resolvedUrl: res.finalUrl.toString(),
+            };
           }
 
           async function main() {
@@ -437,10 +764,78 @@ jobs:
               throw new Error('Invalid recipient email');
             }
 
-            const result = await downloadFile(targetUrl);
-            const finalName = customFilename ? sanitizeFilename(customFilename) : result.filename;
+            const validatedTarget = await validatePublicUrl(targetUrl);
+            const transporter = nodemailer.createTransport({
+              host: 'smtp.gmail.com',
+              port: 465,
+              secure: true,
+              auth: { user: gmailUser, pass: gmailPass },
+            });
+
             const outDir = '/tmp/link2mail-artifacts';
             fs.mkdirSync(outDir, { recursive: true });
+            let hasArtifact = false;
+
+            if (isGeminiShareUrl(validatedTarget)) {
+              const geminiAssets = await resolveGeminiShareUrls(validatedTarget);
+              const attachments = [];
+              const overflowLinks = [];
+              const usedNames = new Set();
+              let attachedBytes = 0;
+
+              for (let idx = 0; idx < geminiAssets.length; idx++) {
+                const asset = geminiAssets[idx];
+                let name = idx === 0 && customFilename ? sanitizeFilename(customFilename) : asset.filename;
+                if (usedNames.has(name)) {
+                  const ext = path.extname(name);
+                  const base = path.basename(name, ext);
+                  name = sanitizeFilename(`${base}-${idx + 1}${ext}`);
+                }
+                usedNames.add(name);
+
+                if (!asset.oversizeArtifact && !asset.tooLargeForEmail && attachedBytes + asset.sizeBytes <= MAX_MULTI_EMAIL_BYTES) {
+                  attachments.push({ filename: name, content: asset.buffer, contentType: asset.mime });
+                  attachedBytes += asset.sizeBytes;
+                } else {
+                  overflowLinks.push(`${name} (${(asset.sizeBytes / (1024 * 1024)).toFixed(2)} MB): ${asset.resolvedUrl}`);
+                  if (!asset.oversizeArtifact) {
+                    const outPath = path.resolve(outDir, name);
+                    if (!outPath.startsWith(outDir + path.sep)) throw new Error('Unsafe artifact path');
+                    fs.writeFileSync(outPath, asset.buffer);
+                    hasArtifact = true;
+                  }
+                }
+              }
+
+              if (process.env.GITHUB_OUTPUT) {
+                fs.appendFileSync(process.env.GITHUB_OUTPUT, hasArtifact ? `has_artifact=true\nartifact_dir=${outDir}\n` : `has_artifact=false\n`);
+              }
+
+              const primaryName = (attachments[0] && attachments[0].filename) || geminiAssets[0].filename;
+              const subject = customSubject || `שיתוף Gemini (${geminiAssets.length} קבצים/תמונות): ${primaryName}`;
+              const totalMb = (attachedBytes / (1024 * 1024)).toFixed(2);
+              const bodyLines = [
+                `חולצו ${geminiAssets.length} קבצים/תמונות תקינים מתוך שיתוף Gemini והורדו בשרתי GitHub (מחוץ לסינון המקומי):`,
+                targetUrl,
+                '',
+                attachments.length ? `מצורפים למייל ${attachments.length} קבצים (${totalMb} MB סה"כ).` : '',
+                overflowLinks.length ? `\nקבצים נוספים שחרגו ממגבלת הצרופה (זמינים בקישורים הבאים):\n${overflowLinks.join('\n')}` : '',
+                hasArtifact && runUrl ? `\nניתן להוריד קבצים נוספים מ-GitHub Artifacts:\n${runUrl}` : '',
+              ].filter(Boolean);
+
+              await transporter.sendMail({
+                from: gmailUser,
+                to,
+                subject,
+                text: bodyLines.join('\n'),
+                attachments,
+              });
+              console.log(`Sent ${attachments.length} Gemini assets (${totalMb} MB) to ${to}`);
+              return;
+            }
+
+            const result = await downloadFile(targetUrl);
+            const finalName = customFilename ? sanitizeFilename(customFilename) : result.filename;
 
             if (result.tooLargeForEmail && !result.oversizeArtifact) {
               const outPath = path.resolve(outDir, finalName);
@@ -448,19 +843,12 @@ jobs:
                 throw new Error('Unsafe artifact path');
               }
               fs.writeFileSync(outPath, result.buffer);
-              if (process.env.GITHUB_OUTPUT) {
-                fs.appendFileSync(process.env.GITHUB_OUTPUT, `has_artifact=true\nartifact_dir=${outDir}\n`);
-              }
-            } else if (process.env.GITHUB_OUTPUT) {
-              fs.appendFileSync(process.env.GITHUB_OUTPUT, `has_artifact=false\n`);
+              hasArtifact = true;
             }
 
-            const transporter = nodemailer.createTransport({
-              host: 'smtp.gmail.com',
-              port: 465,
-              secure: true,
-              auth: { user: gmailUser, pass: gmailPass },
-            });
+            if (process.env.GITHUB_OUTPUT) {
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, hasArtifact ? `has_artifact=true\nartifact_dir=${outDir}\n` : `has_artifact=false\n`);
+            }
 
             const subject = customSubject || (result.tooLargeForEmail ? `קישור/קובץ גדול מהענן: ${finalName}` : `קובץ מהענן: ${finalName}`);
             const sizeMb = (result.sizeBytes / (1024 * 1024)).toFixed(2);
