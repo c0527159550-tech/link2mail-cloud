@@ -1,4 +1,5 @@
 name: Link2Mail Cloud Downloader
+# LINK2MAIL_WORKFLOW_V4
 
 on:
   workflow_dispatch:
@@ -33,11 +34,12 @@ jobs:
           node-version: '20'
 
       - name: Install nodemailer
+        if: ${{ !startsWith(github.event.inputs.url, 'search-json:') }}
         run: |
           mkdir -p /tmp/link2mail-worker
           cd /tmp/link2mail-worker
           npm init -y > /dev/null 2>&1
-          npm install --no-audit --no-fund nodemailer > /dev/null 2>&1
+          npm install --no-audit --no-fund nodemailer ws > /dev/null 2>&1
 
       - name: Download URL in Cloud and Send via Gmail
         id: worker
@@ -51,13 +53,17 @@ jobs:
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           NODE_PATH=/tmp/link2mail-worker/node_modules node << 'EOF'
+          const { execFile, spawn } = require('node:child_process');
           const dns = require('node:dns/promises');
           const fs = require('node:fs');
           const http = require('node:http');
           const https = require('node:https');
           const net = require('node:net');
+          const os = require('node:os');
           const path = require('node:path');
-          const nodemailer = require('nodemailer');
+          const { promisify } = require('node:util');
+
+          const execFileAsync = promisify(execFile);
 
           const MAX_EMAIL_BYTES = 18 * 1024 * 1024;
           const MAX_MULTI_EMAIL_BYTES = 17 * 1024 * 1024;
@@ -66,6 +72,7 @@ jobs:
           const MAX_REDIRECTS = 6;
           const FETCH_TIMEOUT_MS = 900000;
           const ARTIFACT_OUT_DIR = '/tmp/link2mail-artifacts';
+          const CHROME_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
           const MIME_TO_EXT = {
             'application/pdf': '.pdf',
@@ -167,9 +174,97 @@ jobs:
             const out = {};
             for (const [key, val] of Object.entries(rawHeaders)) {
               if (val === undefined) continue;
-              out[key.toLowerCase()] = Array.isArray(val) ? val.join(', ') : val;
+              const lk = key.toLowerCase();
+              if (lk === 'set-cookie') continue;
+              out[lk] = Array.isArray(val) ? val.join(', ') : val;
             }
             return out;
+          }
+
+          function createCookieJar() {
+            return new Map();
+          }
+
+          function absorbSetCookies(jar, urlObj, rawSetCookies) {
+            if (!jar || !Array.isArray(rawSetCookies) || !rawSetCookies.length) return;
+            const reqHost = urlObj.hostname.toLowerCase();
+            for (const rawCookie of rawSetCookies) {
+              if (typeof rawCookie !== 'string') continue;
+              const parts = rawCookie.split(';').map((p) => p.trim()).filter(Boolean);
+              if (!parts.length) continue;
+              const eqIdx = parts[0].indexOf('=');
+              if (eqIdx <= 0) continue;
+              const name = parts[0].slice(0, eqIdx).trim();
+              const value = parts[0].slice(eqIdx + 1).trim();
+              if (!name) continue;
+              let domain = reqHost;
+              let expired = false;
+              for (const attr of parts.slice(1)) {
+                const aEq = attr.indexOf('=');
+                const ak = (aEq > 0 ? attr.slice(0, aEq) : attr).trim().toLowerCase();
+                const av = aEq > 0 ? attr.slice(aEq + 1).trim() : '';
+                if (ak === 'domain' && av) {
+                  const cand = av.replace(/^\.+/, '').toLowerCase();
+                  if (reqHost === cand || reqHost.endsWith('.' + cand)) {
+                    domain = cand;
+                  }
+                } else if (ak === 'max-age') {
+                  const sec = Number(av);
+                  if (!Number.isNaN(sec) && sec <= 0) expired = true;
+                }
+              }
+              if (!jar.has(domain)) jar.set(domain, new Map());
+              const domainMap = jar.get(domain);
+              if (expired) domainMap.delete(name);
+              else domainMap.set(name, value);
+            }
+          }
+
+          function formatCookiesForUrl(jar, urlObj) {
+            if (!jar || jar.size === 0) return '';
+            const reqHost = urlObj.hostname.toLowerCase();
+            const pairs = [];
+            const seen = new Set();
+            for (const [domain, domainMap] of jar.entries()) {
+              if (reqHost === domain || reqHost.endsWith('.' + domain)) {
+                for (const [name, value] of domainMap.entries()) {
+                  if (seen.has(name)) continue;
+                  seen.add(name);
+                  pairs.push(`${name}=${value}`);
+                }
+              }
+            }
+            return pairs.join('; ');
+          }
+
+          function throwIfLoginWallRedirect(nextUrl, initialUrlStr, redirectHosts) {
+            const host = nextUrl.hostname.toLowerCase();
+            const p = nextUrl.pathname.toLowerCase();
+            const isGoogleLogin =
+              host === 'accounts.google.com' &&
+              (p.startsWith('/servicelogin') || p.startsWith('/v3/signin') || p.startsWith('/accountchooser') || p.startsWith('/interactivelogin'));
+            const isMicrosoftLogin =
+              (host === 'login.microsoftonline.com' || host === 'login.live.com') &&
+              (p.includes('/login') || p.includes('/oauth2') || p.includes('/authorize'));
+
+            if (!isGoogleLogin && !isMicrosoftLogin) return;
+
+            let initialHost = '';
+            try { initialHost = new URL(initialUrlStr).hostname.toLowerCase(); } catch {}
+            const wasGoogleGroups =
+              initialHost.endsWith('.googlegroups.com') ||
+              initialHost === 'googlegroups.com' ||
+              initialHost === 'groups.google.com' ||
+              redirectHosts.some((h) => h.endsWith('.googlegroups.com') || h === 'googlegroups.com' || h === 'groups.google.com');
+
+            if (wasGoogleGroups) {
+              throw new Error(
+                'הקישור שייך לקבוצת Google Groups פרטית או שפג תוקף אסימון הצפייה (vt=...), ולכן Google מבקשת התחברות לחשבון שלך (accounts.google.com). שרת מרוחק אינו יכול להוריד קבצים שדורשים התחברות. פתרון: פתח את התמונה בדפדפן אצלך, לחץ מקש ימני -> העתק תמונה, והדבק כאן ישירות בצ\'אט (Ctrl+V).'
+              );
+            }
+            throw new Error(
+              `הקישור מפנה לדף התחברות (${host}) ודורש שם משתמש וסיסמה. שרת מרוחק אינו יכול להוריד קבצים פרטיים ללא התחברות.`
+            );
           }
 
           function sendSingleHttpRequest(targetUrl, options) {
@@ -220,6 +315,17 @@ jobs:
               };
 
               const reqHeaders = Object.assign({ 'Accept-Encoding': 'identity' }, options.headers || {});
+              const jarCookieHeader = formatCookiesForUrl(options.cookieJar, targetUrl);
+              if (jarCookieHeader) {
+                const existingCookieKey = Object.keys(reqHeaders).find((k) => k.toLowerCase() === 'cookie');
+                if (existingCookieKey) {
+                  if (!reqHeaders[existingCookieKey].includes(jarCookieHeader)) {
+                    reqHeaders[existingCookieKey] = `${reqHeaders[existingCookieKey]}; ${jarCookieHeader}`;
+                  }
+                } else {
+                  reqHeaders.Cookie = jarCookieHeader;
+                }
+              }
               if (options.body !== undefined) {
                 reqHeaders['Content-Length'] = String(Buffer.byteLength(options.body, 'utf8'));
               }
@@ -234,6 +340,13 @@ jobs:
                 (res) => {
                   activeRes = res;
                   const status = res.statusCode || 0;
+                  const rawSetCookies = res.headers['set-cookie'];
+                  const setCookieHeaders = Array.isArray(rawSetCookies)
+                    ? rawSetCookies
+                    : rawSetCookies
+                      ? [rawSetCookies]
+                      : [];
+                  absorbSetCookies(options.cookieJar, targetUrl, setCookieHeaders);
                   const headers = normalizeIncomingHeaders(res.headers);
                   const rawLen = headers['content-length'];
                   const declaredSize = rawLen ? Number(rawLen) : NaN;
@@ -244,6 +357,7 @@ jobs:
                     finishResolve({
                       status,
                       headers,
+                      setCookieHeaders,
                       buffer: Buffer.alloc(0),
                       tempFilePath: null,
                       finalUrl: targetUrl,
@@ -259,6 +373,7 @@ jobs:
                     finishResolve({
                       status,
                       headers,
+                      setCookieHeaders,
                       buffer: Buffer.alloc(0),
                       tempFilePath: null,
                       finalUrl: targetUrl,
@@ -300,6 +415,7 @@ jobs:
                       finishResolve({
                         status,
                         headers,
+                        setCookieHeaders,
                         buffer: Buffer.alloc(0),
                         tempFilePath: null,
                         finalUrl: targetUrl,
@@ -334,6 +450,7 @@ jobs:
                         finishResolve({
                           status,
                           headers,
+                          setCookieHeaders,
                           buffer: Buffer.alloc(0),
                           tempFilePath: savedPath,
                           finalUrl: targetUrl,
@@ -345,6 +462,7 @@ jobs:
                       finishResolve({
                         status,
                         headers,
+                        setCookieHeaders,
                         buffer: Buffer.concat(chunks, totalBytes),
                         tempFilePath: null,
                         finalUrl: targetUrl,
@@ -369,12 +487,15 @@ jobs:
             const maxBytes = options.maxBytes || MAX_ARTIFACT_BYTES;
             const timeoutMs = options.timeoutMs || FETCH_TIMEOUT_MS;
             const maxRedirects = options.maxRedirects || MAX_REDIRECTS;
+            const cookieJar = options.cookieJar || createCookieJar();
             const headers = options.headers || {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+              'User-Agent': CHROME_USER_AGENT,
               Accept: '*/*',
             };
 
             let current = await validatePublicUrl(initialUrl);
+            const redirectHosts = [current.hostname.toLowerCase()];
+
             for (let i = 0; i <= maxRedirects; i++) {
               const res = await sendSingleHttpRequest(current, {
                 method: i === 0 ? method : method === 'POST' ? 'GET' : method,
@@ -382,6 +503,7 @@ jobs:
                 body: i === 0 ? options.body : undefined,
                 maxBytes,
                 timeoutMs,
+                cookieJar,
                 probeOnly: Boolean(options.probeOnly),
                 allowDiskStream: Boolean(options.allowDiskStream),
               });
@@ -393,12 +515,15 @@ jobs:
                   return {
                     status: res.status,
                     headers: res.headers,
+                    setCookieHeaders: res.setCookieHeaders,
                     buffer: Buffer.alloc(0),
                     finalUrl: current,
                     oversize: false,
                     declaredSize: 0,
                   };
                 }
+                throwIfLoginWallRedirect(current, initialUrl, redirectHosts);
+                redirectHosts.push(current.hostname.toLowerCase());
                 continue;
               }
               return res;
@@ -803,31 +928,462 @@ jobs:
             return validAssets;
           }
 
-          async function downloadFile(initialUrl, allowEmbeddedRetry = true, refererUrl = '') {
-            const reqHeaders = {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-              Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,audio/*,video/*,*/*;q=0.8',
-              'Accept-Language': 'he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7',
-            };
-            if (refererUrl) reqHeaders.Referer = refererUrl;
+          function isCloudflareChallengeResponse(status, headers, bodyBuf) {
+            const cfMitigated = (headers && headers['cf-mitigated'] ? headers['cf-mitigated'] : '').toLowerCase();
+            if (cfMitigated.includes('challenge')) return true;
+            const server = (headers && headers.server ? headers.server : '').toLowerCase();
+            if (!server.includes('cloudflare')) return false;
+            if (![403, 429, 503].includes(status)) return false;
+            const snippet = bodyBuf && bodyBuf.length ? bodyBuf.subarray(0, 16384).toString('utf8') : '';
+            return /Just a moment|challenges\.cloudflare\.com|_cf_chl_opt|Enable JavaScript and cookies/i.test(snippet);
+          }
 
-            const res = await httpRequestWithLargeHeaders(normalizeShareUrl(initialUrl), {
+          function parseLastCurlHeaders(rawHdrText) {
+            const blocks = rawHdrText.trim().split(/\r?\n\r?\n/);
+            const last = blocks[blocks.length - 1] || '';
+            const out = {};
+            for (const line of last.split(/\r?\n/).slice(1)) {
+              const idx = line.indexOf(':');
+              if (idx <= 0) continue;
+              const k = line.slice(0, idx).trim().toLowerCase();
+              const v = line.slice(idx + 1).trim();
+              out[k] = v;
+            }
+            return out;
+          }
+
+          async function downloadViaCurl(targetUrlStr, refererUrl, cookieHeader, userAgent = CHROME_USER_AGENT) {
+            const validated = await validatePublicUrl(targetUrlStr);
+            const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'l2m-curl-'));
+            const hdrPath = path.join(tmpDir, 'headers.txt');
+            const bodyPath = path.join(tmpDir, 'body.part');
+            const cookieJarFile = path.join(tmpDir, 'cookies.txt');
+
+            try {
+              const runCurl = async (urlToFetch, extraHeaders = [], outputTarget = bodyPath, hdrTarget = hdrPath) => {
+                const args = [
+                  '--silent',
+                  '--show-error',
+                  '--location',
+                  '--http2',
+                  '--compressed',
+                  '--max-redirs', String(MAX_REDIRECTS),
+                  '--connect-timeout', '20',
+                  '--max-time', '600',
+                  '--proto', '=http,https',
+                  '--proto-redir', '=http,https',
+                  '--max-filesize', String(MAX_ARTIFACT_BYTES),
+                  '-A', userAgent,
+                  '-H', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,audio/*,video/*,*/*;q=0.8',
+                  '-H', 'Accept-Language: he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7',
+                  '-H', 'Sec-Fetch-Dest: document',
+                  '-H', 'Sec-Fetch-Mode: navigate',
+                  '-H', 'Sec-Fetch-Site: same-origin',
+                  '-c', cookieJarFile,
+                  '-b', cookieJarFile,
+                  ...extraHeaders,
+                  '-D', hdrTarget,
+                  '-o', outputTarget,
+                  '-w', '__L2M__%{http_code}|%{url_effective}|%{content_type}|%{size_download}',
+                  '--',
+                  urlToFetch,
+                ];
+                const { stdout } = await execFileAsync('curl', args, { maxBuffer: 2 * 1024 * 1024 });
+                const markerIdx = stdout.lastIndexOf('__L2M__');
+                const metaRaw = markerIdx >= 0 ? stdout.slice(markerIdx + 7).trim() : '';
+                const [codeStr = '0', effectiveUrl = urlToFetch, rawCt = '', sizeStr = '0'] = metaRaw.split('|');
+                return {
+                  status: Number(codeStr) || 0,
+                  effectiveUrl: effectiveUrl || urlToFetch,
+                  contentType: rawCt || '',
+                  sizeBytes: Number(sizeStr) || 0,
+                };
+              };
+
+              const reqExtra = [];
+              if (refererUrl) reqExtra.push('-e', refererUrl);
+              if (cookieHeader) reqExtra.push('-H', `Cookie: ${cookieHeader}`);
+
+              let curlMeta = await runCurl(validated.toString(), reqExtra);
+              let finalUrlObj = await validatePublicUrl(curlMeta.effectiveUrl);
+              throwIfLoginWallRedirect(finalUrlObj, validated.toString(), [validated.hostname.toLowerCase()]);
+
+              // Warm up origin root if first curl returned 403/429/503 without pre-supplied cookies
+              if ([403, 429, 503].includes(curlMeta.status) && !cookieHeader) {
+                const warmHdr = path.join(tmpDir, 'warm_hdr.txt');
+                const warmBody = path.join(tmpDir, 'warm_body.html');
+                const originUrl = await validatePublicUrl(`${validated.origin}/`);
+                await runCurl(originUrl.toString(), [], warmBody, warmHdr).catch(() => {});
+                curlMeta = await runCurl(validated.toString(), ['-e', `${validated.origin}/`]);
+                finalUrlObj = await validatePublicUrl(curlMeta.effectiveUrl);
+                throwIfLoginWallRedirect(finalUrlObj, validated.toString(), [validated.hostname.toLowerCase()]);
+              }
+
+              const headers = fs.existsSync(hdrPath) ? parseLastCurlHeaders(fs.readFileSync(hdrPath, 'utf8')) : {};
+              const fileStats = fs.existsSync(bodyPath) ? fs.statSync(bodyPath) : null;
+              const actualSize = fileStats ? fileStats.size : curlMeta.sizeBytes;
+              const bodyBuf = actualSize > 0 && actualSize <= MAX_EMAIL_BYTES ? fs.readFileSync(bodyPath) : Buffer.alloc(0);
+
+              let movedTempPath = null;
+              if (actualSize > MAX_EMAIL_BYTES && fileStats) {
+                fs.mkdirSync(ARTIFACT_OUT_DIR, { recursive: true });
+                movedTempPath = path.join(ARTIFACT_OUT_DIR, `_curl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.part`);
+                fs.renameSync(bodyPath, movedTempPath);
+              }
+
+              const mime = (curlMeta.contentType || headers['content-type'] || 'application/octet-stream').split(';')[0].trim().toLowerCase();
+              return {
+                status: curlMeta.status,
+                headers,
+                buffer: bodyBuf,
+                tempFilePath: movedTempPath,
+                finalUrl: finalUrlObj,
+                oversize: actualSize > MAX_ARTIFACT_BYTES,
+                declaredSize: actualSize,
+                mime,
+              };
+            } finally {
+              try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+            }
+          }
+
+          async function findChromeBinary() {
+            const candidates = ['/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser'];
+            for (const p of candidates) {
+              if (fs.existsSync(p)) return p;
+            }
+            return null;
+          }
+
+          async function downloadWithBrowserChallengeSolver(targetUrlStr) {
+            const chromePath = await findChromeBinary();
+            if (!chromePath) return null;
+
+            let WebSocketClient;
+            try {
+              WebSocketClient = require('ws');
+            } catch {
+              return null;
+            }
+
+            const validated = await validatePublicUrl(targetUrlStr);
+            const tmpProfile = fs.mkdtempSync(path.join(os.tmpdir(), 'l2m-chrome-'));
+            const debugPort = 39000 + Math.floor(Math.random() * 5000);
+            const hasXvfb = fs.existsSync('/usr/bin/xvfb-run');
+
+            const chromeArgs = [
+              `--remote-debugging-port=${debugPort}`,
+              `--user-data-dir=${tmpProfile}`,
+              '--no-sandbox',
+              '--disable-setuid-sandbox',
+              '--disable-dev-shm-usage',
+              '--no-first-run',
+              '--no-default-browser-check',
+              '--disable-blink-features=AutomationControlled',
+              '--window-size=1366,768',
+              '--disable-gpu',
+              ...(hasXvfb ? [] : ['--headless=new']),
+              'about:blank',
+            ];
+
+            const cmd = hasXvfb ? '/usr/bin/xvfb-run' : chromePath;
+            const args = hasXvfb ? ['-a', '--server-args=-screen 0 1366x768x24', chromePath, ...chromeArgs] : chromeArgs;
+            const child = spawn(cmd, args, { stdio: 'ignore', detached: false });
+
+            let ws = null;
+            try {
+              // Wait for CDP endpoint
+              let pageWsUrl = null;
+              for (let attempt = 0; attempt < 30; attempt++) {
+                await new Promise((r) => setTimeout(r, 250));
+                try {
+                  const targetsRes = await new Promise((resolve, reject) => {
+                    const req = http.get(`http://127.0.0.1:${debugPort}/json/list`, (res) => {
+                      const chunks = [];
+                      res.on('data', (c) => chunks.push(c));
+                      res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+                    });
+                    req.on('error', reject);
+                    req.setTimeout(1000, () => req.destroy(new Error('timeout')));
+                  });
+                  const list = JSON.parse(targetsRes);
+                  const pageTarget = Array.isArray(list) && list.find((t) => t.type === 'page' && t.webSocketDebuggerUrl);
+                  if (pageTarget) {
+                    pageWsUrl = pageTarget.webSocketDebuggerUrl;
+                    break;
+                  }
+                } catch {}
+              }
+              if (!pageWsUrl) return null;
+
+              ws = new WebSocketClient(pageWsUrl);
+              await new Promise((resolve, reject) => {
+                const t = setTimeout(() => reject(new Error('CDP connect timeout')), 5000);
+                ws.once('open', () => { clearTimeout(t); resolve(); });
+                ws.once('error', (e) => { clearTimeout(t); reject(e); });
+              });
+
+              let nextId = 1;
+              const pending = new Map();
+              let capturedTargetResponse = null;
+
+              const sendCdp = (method, params = {}) => new Promise((resolve, reject) => {
+                const id = nextId++;
+                const t = setTimeout(() => {
+                  pending.delete(id);
+                  reject(new Error(`CDP timeout: ${method}`));
+                }, 10000);
+                pending.set(id, {
+                  resolve: (res) => { clearTimeout(t); resolve(res); },
+                  reject: (err) => { clearTimeout(t); reject(err); },
+                });
+                ws.send(JSON.stringify({ id, method, params }));
+              });
+
+              ws.on('message', async (raw) => {
+                let msg;
+                try { msg = JSON.parse(String(raw)); } catch { return; }
+                if (msg.id && pending.has(msg.id)) {
+                  const p = pending.get(msg.id);
+                  pending.delete(msg.id);
+                  if (msg.error) p.reject(new Error(msg.error.message || 'CDP error'));
+                  else p.resolve(msg.result || {});
+                  return;
+                }
+                if (msg.method === 'Fetch.requestPaused' && msg.params) {
+                  const { requestId, request } = msg.params;
+                  const rUrl = (request && request.url) || '';
+                  let allowed = false;
+                  if (rUrl.startsWith('http://') || rUrl.startsWith('https://')) {
+                    try {
+                      await validatePublicUrl(rUrl);
+                      allowed = true;
+                    } catch {
+                      allowed = false;
+                    }
+                  } else if (/^(?:data:|blob:|about:)/i.test(rUrl)) {
+                    allowed = true;
+                  }
+                  if (allowed) {
+                    sendCdp('Fetch.continueRequest', { requestId }).catch(() => {});
+                  } else {
+                    sendCdp('Fetch.failRequest', { requestId, errorReason: 'AccessDenied' }).catch(() => {});
+                  }
+                } else if (msg.method === 'Network.responseReceived' && msg.params && msg.params.response) {
+                  const r = msg.params.response;
+                  if (r.url === validated.toString() && r.status >= 200 && r.status < 300) {
+                    const mt = (r.mimeType || '').toLowerCase();
+                    if (mt && mt !== 'text/html') {
+                      capturedTargetResponse = {
+                        requestId: msg.params.requestId,
+                        status: r.status,
+                        mimeType: mt,
+                        headers: normalizeIncomingHeaders(r.headers || {}),
+                        url: r.url,
+                      };
+                    }
+                  }
+                }
+              });
+
+              await sendCdp('Page.enable');
+              await sendCdp('Network.enable');
+              await sendCdp('Runtime.enable');
+              await sendCdp('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+              await sendCdp('Page.addScriptToEvaluateOnNewDocument', {
+                source: 'Object.defineProperty(navigator, "webdriver", { get: () => undefined });',
+              });
+
+              const uaEval = await sendCdp('Runtime.evaluate', { expression: 'navigator.userAgent', returnByValue: true });
+              const realUa = (uaEval && uaEval.result && uaEval.result.value) || CHROME_USER_AGENT;
+
+              // Visit site origin first if target looks like a direct asset, or visit target directly
+              const isDirectAsset = /\.(?:jpe?g|png|gif|webp|avif|mp3|mp4|pdf|zip|docx?|xlsx?|pptx?|m4a|wav|webm)(?:$|\?)/i.test(validated.pathname);
+              const firstUrl = isDirectAsset ? `${validated.origin}/` : validated.toString();
+              await sendCdp('Page.navigate', { url: firstUrl });
+
+              // Wait up to 11s for Cloudflare JS challenge or cf_clearance cookie
+              let cleared = false;
+              let latestCookies = [];
+              for (let tick = 0; tick < 22; tick++) {
+                await new Promise((r) => setTimeout(r, 500));
+                try {
+                  const ckRes = await sendCdp('Network.getAllCookies');
+                  latestCookies = (ckRes && ckRes.cookies) || [];
+                  const hasClearance = latestCookies.some((c) => c.name === 'cf_clearance');
+                  const titleEval = await sendCdp('Runtime.evaluate', { expression: 'document.title', returnByValue: true });
+                  const pageTitle = String((titleEval && titleEval.result && titleEval.result.value) || '');
+                  if (hasClearance || (pageTitle && !/just a moment|attention required|cloudflare/i.test(pageTitle))) {
+                    cleared = true;
+                    break;
+                  }
+                } catch {}
+              }
+
+              const cookieStr = latestCookies
+                .filter((c) => {
+                  const dom = (c.domain || '').replace(/^\.+/, '').toLowerCase();
+                  const h = validated.hostname.toLowerCase();
+                  return dom && (h === dom || h.endsWith('.' + dom));
+                })
+                .map((c) => `${c.name}=${c.value}`)
+                .join('; ');
+
+              if (cookieStr) {
+                try {
+                  const curlAfterBrowser = await downloadViaCurl(validated.toString(), `${validated.origin}/`, cookieStr, realUa);
+                  if (curlAfterBrowser.status >= 200 && curlAfterBrowser.status < 300) {
+                    return curlAfterBrowser;
+                  }
+                } catch {}
+              }
+
+              // Fallback: navigate directly to target inside Chrome and try grabbing Network body
+              if (firstUrl !== validated.toString()) {
+                await sendCdp('Page.navigate', { url: validated.toString() });
+                for (let tick = 0; tick < 16; tick++) {
+                  await new Promise((r) => setTimeout(r, 500));
+                  if (capturedTargetResponse) break;
+                }
+              }
+
+              if (capturedTargetResponse) {
+                try {
+                  const bodyRes = await sendCdp('Network.getResponseBody', { requestId: capturedTargetResponse.requestId });
+                  if (bodyRes && typeof bodyRes.body === 'string') {
+                    const buf = Buffer.from(bodyRes.body, bodyRes.base64Encoded ? 'base64' : 'utf8');
+                    if (buf.byteLength > 0) {
+                      return {
+                        status: capturedTargetResponse.status,
+                        headers: capturedTargetResponse.headers,
+                        buffer: buf,
+                        tempFilePath: null,
+                        finalUrl: await validatePublicUrl(capturedTargetResponse.url),
+                        oversize: false,
+                        declaredSize: buf.byteLength,
+                        mime: capturedTargetResponse.mimeType,
+                      };
+                    }
+                  }
+                } catch {}
+              }
+
+              if (!cleared) {
+                return { challengeStillActive: true };
+              }
+              return null;
+            } catch {
+              return null;
+            } finally {
+              if (ws) {
+                try { ws.close(); } catch {}
+              }
+              try {
+                if (child && child.pid) process.kill(child.pid, 'SIGKILL');
+              } catch {}
+              try { fs.rmSync(tmpProfile, { recursive: true, force: true }); } catch {}
+            }
+          }
+
+          async function downloadFile(initialUrl, allowEmbeddedRetry = true, refererUrl = '') {
+            const normalizedUrl = normalizeShareUrl(initialUrl);
+            const parsedInitial = new URL(normalizedUrl);
+            const cookieJar = createCookieJar();
+
+            const buildBrowserHeaders = (ref) => {
+              const h = {
+                'User-Agent': CHROME_USER_AGENT,
+                Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,audio/*,video/*,*/*;q=0.8',
+                'Accept-Language': 'he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': ref ? 'same-origin' : 'none',
+                'Upgrade-Insecure-Requests': '1',
+              };
+              if (ref) h.Referer = ref;
+              return h;
+            };
+
+            let res = await httpRequestWithLargeHeaders(normalizedUrl, {
               method: 'GET',
               maxBytes: MAX_ARTIFACT_BYTES,
               timeoutMs: FETCH_TIMEOUT_MS,
               maxRedirects: MAX_REDIRECTS,
               allowDiskStream: true,
-              headers: reqHeaders,
+              cookieJar,
+              headers: buildBrowserHeaders(refererUrl),
             });
+
+            // Layer 1: Warm-up origin + Referer if rejected with 403/429/503
+            if ([403, 429, 503].includes(res.status)) {
+              try {
+                await httpRequestWithLargeHeaders(`${parsedInitial.origin}/`, {
+                  method: 'GET',
+                  maxBytes: 262144,
+                  timeoutMs: 12000,
+                  maxRedirects: 4,
+                  cookieJar,
+                  headers: buildBrowserHeaders(''),
+                });
+                res = await httpRequestWithLargeHeaders(normalizedUrl, {
+                  method: 'GET',
+                  maxBytes: MAX_ARTIFACT_BYTES,
+                  timeoutMs: FETCH_TIMEOUT_MS,
+                  maxRedirects: MAX_REDIRECTS,
+                  allowDiskStream: true,
+                  cookieJar,
+                  headers: buildBrowserHeaders(refererUrl || `${parsedInitial.origin}/`),
+                });
+              } catch {}
+            }
+
+            // Layer 2: curl --http2 TLS/HTTP2 fallback
+            if ([403, 429, 503].includes(res.status)) {
+              try {
+                const jarCookieStr = formatCookiesForUrl(cookieJar, parsedInitial);
+                const curlRes = await downloadViaCurl(normalizedUrl, refererUrl || `${parsedInitial.origin}/`, jarCookieStr);
+                if (curlRes.status >= 200 && curlRes.status < 300) {
+                  res = curlRes;
+                } else {
+                  res = curlRes;
+                }
+              } catch (curlErr) {
+                if (curlErr && /Google Groups|דף התחברות/i.test(String(curlErr.message))) {
+                  throw curlErr;
+                }
+              }
+            }
+
+            // Layer 3: Real Chrome CDP challenge solver if blocked by Cloudflare JS challenge or persistent 403
+            let cloudflareBlockedAfterBrowser = isCloudflareChallengeResponse(res.status, res.headers, res.buffer);
+            if ([403, 429, 503].includes(res.status)) {
+              const browserRes = await downloadWithBrowserChallengeSolver(normalizedUrl);
+              if (browserRes && browserRes.challengeStillActive) {
+                cloudflareBlockedAfterBrowser = true;
+              } else if (browserRes && browserRes.status >= 200 && browserRes.status < 300) {
+                res = browserRes;
+                cloudflareBlockedAfterBrowser = false;
+              }
+            }
 
             if (res.status < 200 || res.status >= 300) {
               if (res.tempFilePath && fs.existsSync(res.tempFilePath)) {
                 try { fs.unlinkSync(res.tempFilePath); } catch {}
               }
+              if (cloudflareBlockedAfterBrowser || isCloudflareChallengeResponse(res.status, res.headers, res.buffer)) {
+                throw new Error(
+                  `האתר (${res.finalUrl.hostname}) מוגן ע"י מנגנון אבטחה נגד בוטים של Cloudflare שדורש אימות אנושי בדפדפן, ולכן לא ניתן להוריד ממנו אוטומטית מהענן. פתרון: פתח את התמונה בדפדפן אצלך, לחץ מקש ימני -> העתק תמונה, והדבק כאן ישירות בצ'אט (Ctrl+V).`
+                );
+              }
+              if (res.status === 403) {
+                throw new Error(
+                  `האתר המרוחק (${res.finalUrl.hostname}) דחה את הגישה להורדה מהענן (HTTP 403). אם התמונה/הקובץ פתוחים אצלך בדפדפן, ניתן להעתיק ולהדביק כאן ישירות (Ctrl+V) או לצרף כקובץ.`
+                );
+              }
               throw new Error(`Remote server returned HTTP ${res.status} for ${res.finalUrl.hostname}`);
             }
 
-            const mime = (res.headers['content-type'] || 'application/octet-stream').split(';')[0].trim().toLowerCase();
+            const mime = (res.headers['content-type'] || res.mime || 'application/octet-stream').split(';')[0].trim().toLowerCase();
             const disp = res.headers['content-disposition'] || null;
             const filename = inferFilename(res.finalUrl, disp, mime);
 
@@ -878,6 +1434,212 @@ jobs:
             };
           }
 
+          const EXT_TO_MEDIA_MIME = {
+            '.mp3': { category: 'audio', mime: 'audio/mpeg' },
+            '.m4a': { category: 'audio', mime: 'audio/mp4' },
+            '.ogg': { category: 'audio', mime: 'audio/ogg' },
+            '.oga': { category: 'audio', mime: 'audio/ogg' },
+            '.opus': { category: 'audio', mime: 'audio/opus' },
+            '.aac': { category: 'audio', mime: 'audio/aac' },
+            '.wav': { category: 'audio', mime: 'audio/wav' },
+            '.flac': { category: 'audio', mime: 'audio/flac' },
+            '.mp4': { category: 'video', mime: 'video/mp4' },
+            '.m4v': { category: 'video', mime: 'video/x-m4v' },
+            '.webm': { category: 'video', mime: 'video/webm' },
+            '.mov': { category: 'video', mime: 'video/quicktime' },
+            '.mkv': { category: 'video', mime: 'video/x-matroska' },
+            '.ogv': { category: 'video', mime: 'video/ogg' },
+          };
+
+          function sanitizeSearchTerms(term) {
+            return String(term || '')
+              .replace(/["():{}[\]^~*?\\!+|&<>]/g, ' ')
+              .replace(/\s+/g, ' ')
+              .trim()
+              .slice(0, 100);
+          }
+
+          async function searchInternetArchiveMedia(query, mediaType) {
+            const cleanTerm = sanitizeSearchTerms(query);
+            if (cleanTerm.length < 2) return [];
+            const mediaFilterExpr = mediaType === 'audio' ? 'audio' : mediaType === 'video' ? 'movies' : 'audio OR movies';
+            const params = new URLSearchParams();
+            params.set('q', `(${cleanTerm}) AND mediatype:(${mediaFilterExpr})`);
+            params.append('fl[]', 'identifier');
+            params.append('fl[]', 'title');
+            params.append('fl[]', 'creator');
+            params.append('fl[]', 'mediatype');
+            params.set('rows', '10');
+            params.set('page', '1');
+            params.set('output', 'json');
+
+            const searchRes = await httpRequestWithLargeHeaders(`https://archive.org/advancedsearch.php?${params.toString()}`, {
+              method: 'GET',
+              maxBytes: 1024 * 1024,
+              timeoutMs: 12000,
+              headers: { 'User-Agent': 'Link2Mail-MediaSearch/1.0', Accept: 'application/json' },
+            });
+            if (searchRes.status < 200 || searchRes.status >= 300) {
+              throw new Error(`Archive.org HTTP ${searchRes.status}`);
+            }
+            const searchData = JSON.parse(searchRes.buffer.toString('utf8'));
+            const docs = Array.isArray(searchData && searchData.response && searchData.response.docs) ? searchData.response.docs : [];
+            const validDocs = docs.filter((d) => typeof d.identifier === 'string' && /^[a-zA-Z0-9._-]+$/.test(d.identifier)).slice(0, 8);
+            if (!validDocs.length) return [];
+
+            const lookups = await Promise.allSettled(
+              validDocs.map(async (doc) => {
+                const identifier = String(doc.identifier);
+                const filesRes = await httpRequestWithLargeHeaders(`https://archive.org/metadata/${encodeURIComponent(identifier)}/files`, {
+                  method: 'GET',
+                  maxBytes: 2 * 1024 * 1024,
+                  timeoutMs: 8000,
+                  headers: { 'User-Agent': 'Link2Mail-MediaSearch/1.0', Accept: 'application/json' },
+                });
+                if (filesRes.status < 200 || filesRes.status >= 300) return null;
+                const filesJson = JSON.parse(filesRes.buffer.toString('utf8'));
+                const files = Array.isArray(filesJson && filesJson.result) ? filesJson.result : [];
+                let best = null;
+                for (const file of files) {
+                  if (typeof file.name !== 'string' || !file.name.trim()) continue;
+                  const rawName = file.name.trim();
+                  if (rawName.startsWith('__') || rawName.includes('/__')) continue;
+                  const ext = path.posix.extname(rawName).toLowerCase();
+                  const spec = EXT_TO_MEDIA_MIME[ext];
+                  if (!spec) continue;
+                  if (mediaType !== 'all' && spec.category !== mediaType) continue;
+                  const sizeBytes = Number(file.size || 0);
+                  if (!Number.isFinite(sizeBytes) || sizeBytes <= 0 || sizeBytes > MAX_ARTIFACT_BYTES) continue;
+                  let score = 0;
+                  const srcStr = typeof file.source === 'string' ? file.source.toLowerCase() : '';
+                  const fmtStr = typeof file.format === 'string' ? file.format.toLowerCase() : '';
+                  if (spec.category === 'audio') {
+                    if (ext === '.mp3') score += 70;
+                    else if (ext === '.m4a') score += 55;
+                    else if (ext === '.ogg' || ext === '.oga' || ext === '.opus') score += 35;
+                    else if (ext === '.flac') score += 20;
+                    else score += 10;
+                    if (srcStr === 'original') score += 20;
+                    if (sizeBytes <= MAX_EMAIL_BYTES) score += 35;
+                  } else {
+                    if (ext === '.mp4') score += 70;
+                    else if (ext === '.webm') score += 50;
+                    else if (ext === '.m4v') score += 40;
+                    else score += 20;
+                    if (fmtStr.includes('h.264') || fmtStr.includes('mpeg4')) score += 20;
+                    if (srcStr === 'original') score += 15;
+                    if (sizeBytes < 250000) score -= 40;
+                    if (sizeBytes <= MAX_EMAIL_BYTES && sizeBytes >= 250000) score += 15;
+                  }
+                  if (!best || score > best.score) {
+                    best = { name: rawName, sizeBytes, category: spec.category, mimeType: spec.mime, score };
+                  }
+                }
+                if (!best) return null;
+                const encodedPath = best.name.split('/').map((seg) => encodeURIComponent(seg)).join('/');
+                const directUrl = `https://archive.org/download/${encodeURIComponent(identifier)}/${encodedPath}`;
+                const rawTitle = Array.isArray(doc.title) ? doc.title[0] : doc.title;
+                const rawCreator = Array.isArray(doc.creator) ? doc.creator[0] : doc.creator;
+                const safeFilename = sanitizeFilename(path.posix.basename(best.name));
+                return {
+                  id: `ia-${identifier}`,
+                  title: typeof rawTitle === 'string' && rawTitle.trim() ? rawTitle.trim().slice(0, 140) : safeFilename,
+                  creator: typeof rawCreator === 'string' && rawCreator.trim() ? rawCreator.trim().slice(0, 100) : null,
+                  mediaCategory: best.category,
+                  directUrl,
+                  filename: safeFilename,
+                  mimeType: best.mimeType,
+                  sizeBytes: best.sizeBytes,
+                  sourceLabel: 'Internet Archive',
+                  sourceHost: 'archive.org',
+                  tooLargeForEmail: best.sizeBytes > MAX_EMAIL_BYTES,
+                };
+              })
+            );
+
+            const items = [];
+            for (const r of lookups) {
+              if (r.status === 'fulfilled' && r.value) items.push(r.value);
+            }
+            return items;
+          }
+
+          async function searchWikimediaCommonsMedia(query, mediaType) {
+            const cleanTerm = sanitizeSearchTerms(query);
+            if (cleanTerm.length < 2) return [];
+            const filetypeExpr = mediaType === 'audio' ? 'filetype:audio' : mediaType === 'video' ? 'filetype:video' : 'filetype:audio|video';
+            const params = new URLSearchParams({
+              action: 'query',
+              generator: 'search',
+              gsrsearch: `${filetypeExpr} ${cleanTerm}`,
+              gsrnamespace: '6',
+              gsrlimit: '8',
+              prop: 'imageinfo',
+              iiprop: 'url|size|mime',
+              format: 'json',
+            });
+            const wikiRes = await httpRequestWithLargeHeaders(`https://commons.wikimedia.org/w/api.php?${params.toString()}`, {
+              method: 'GET',
+              maxBytes: 1024 * 1024,
+              timeoutMs: 8000,
+              headers: { 'User-Agent': 'Link2Mail-MediaSearch/1.0 (https://commons.wikimedia.org)', Accept: 'application/json' },
+            });
+            if (wikiRes.status < 200 || wikiRes.status >= 300) throw new Error(`Wikimedia HTTP ${wikiRes.status}`);
+            const wikiData = JSON.parse(wikiRes.buffer.toString('utf8'));
+            const pages = Object.values((wikiData && wikiData.query && wikiData.query.pages) || {});
+            const items = [];
+            for (const page of pages) {
+              const info = page.imageinfo && page.imageinfo[0];
+              if (!info || typeof info.url !== 'string' || !info.url.startsWith('https://upload.wikimedia.org/')) continue;
+              const mime = typeof info.mime === 'string' ? info.mime.split(';')[0].trim().toLowerCase() : '';
+              if (!mime || mime === 'audio/midi' || mime === 'audio/x-midi') continue;
+              const sizeBytes = Number(info.size || 0);
+              if (!Number.isFinite(sizeBytes) || sizeBytes <= 0 || sizeBytes > MAX_ARTIFACT_BYTES) continue;
+              const rawPageTitle = (page.title || '').replace(/^File:/i, '').trim();
+              const safeFilename = sanitizeFilename(rawPageTitle || `wikimedia-${page.pageid || Date.now()}`);
+              const ext = path.posix.extname(safeFilename).toLowerCase();
+              const isAudio = mime.startsWith('audio/') || ['.mp3', '.ogg', '.oga', '.opus', '.wav', '.flac', '.m4a', '.aac'].includes(ext);
+              const isVideo = mime.startsWith('video/') || ['.mp4', '.webm', '.ogv', '.mov', '.mkv', '.m4v'].includes(ext);
+              const category = isAudio ? 'audio' : isVideo ? 'video' : null;
+              if (!category || (mediaType !== 'all' && category !== mediaType)) continue;
+              const displayTitle = rawPageTitle.replace(/\.[^.]+$/, '').replace(/_/g, ' ').trim() || safeFilename;
+              items.push({
+                id: `wm-${page.pageid || items.length}`,
+                title: displayTitle.slice(0, 140),
+                creator: 'Wikimedia Commons',
+                mediaCategory: category,
+                directUrl: info.url,
+                filename: safeFilename,
+                mimeType: mime,
+                sizeBytes,
+                sourceLabel: 'Wikimedia Commons',
+                sourceHost: 'upload.wikimedia.org',
+                tooLargeForEmail: sizeBytes > MAX_EMAIL_BYTES,
+              });
+            }
+            return items;
+          }
+
+          async function runCombinedMediaSearch(query, mediaType) {
+            const [iaRes, wmRes] = await Promise.allSettled([
+              searchInternetArchiveMedia(query, mediaType),
+              searchWikimediaCommonsMedia(query, mediaType),
+            ]);
+            const merged = [];
+            const seen = new Set();
+            const all = [
+              ...(iaRes.status === 'fulfilled' ? iaRes.value : []),
+              ...(wmRes.status === 'fulfilled' ? wmRes.value : []),
+            ];
+            for (const item of all) {
+              if (seen.has(item.directUrl)) continue;
+              seen.add(item.directUrl);
+              merged.push(item);
+              if (merged.length >= 8) break;
+            }
+            return merged;
+          }
+
           async function main() {
             const targetUrl = (process.env.TARGET_URL || '').trim();
             const to = (process.env.RECIPIENT_EMAIL || '').replace(/[\r\n]+/g, '').trim();
@@ -890,6 +1652,18 @@ jobs:
             if (!targetUrl) {
               throw new Error('Missing TARGET_URL input');
             }
+
+            // Mode A: Cloud Media Search JSON (returns search results via Check Run notice annotation)
+            const jsonSearchMatch = targetUrl.match(/^search-json:([a-zA-Z0-9_-]{4,40}):(all|audio|video):(.+)$/);
+            if (jsonSearchMatch) {
+              const [, sid, mediaType, query] = jsonSearchMatch;
+              const results = await runCombinedMediaSearch(query.trim(), mediaType);
+              const payload = JSON.stringify({ sid, query: query.trim(), mediaType, results });
+              console.log(`::notice title=LINK2MAIL_SEARCH::${payload}`);
+              return;
+            }
+
+            const nodemailer = require('nodemailer');
             if (!gmailUser || !gmailPass) {
               throw new Error('Missing GMAIL_USER or GMAIL_APP_PASSWORD repository secrets');
             }
@@ -897,7 +1671,6 @@ jobs:
               throw new Error('Invalid recipient email');
             }
 
-            const validatedTarget = await validatePublicUrl(targetUrl);
             const transporter = nodemailer.createTransport({
               host: 'smtp.gmail.com',
               port: 465,
@@ -908,6 +1681,76 @@ jobs:
             const outDir = ARTIFACT_OUT_DIR;
             fs.mkdirSync(outDir, { recursive: true });
             let hasArtifact = false;
+
+            // Mode B: Cloud Search & Auto-Send top matching song/video
+            const sendSearchMatch = targetUrl.match(/^(?:search-send|search):(all|audio|video):(.+)$/);
+            if (sendSearchMatch) {
+              const [, mediaType, rawQuery] = sendSearchMatch;
+              const query = rawQuery.trim();
+              const results = await runCombinedMediaSearch(query, mediaType);
+              if (!results.length) {
+                throw new Error(`לא נמצאו קובצי מדיה תואמים עבור "${query}" במאגרים הפתוחים.`);
+              }
+              const top = results[0];
+              const downloaded = await downloadFile(top.directUrl);
+              const finalName = customFilename ? sanitizeFilename(customFilename) : (top.filename || downloaded.filename);
+
+              if (downloaded.tooLargeForEmail && !downloaded.oversizeArtifact) {
+                const outPath = path.resolve(outDir, finalName);
+                if (!outPath.startsWith(outDir + path.sep)) throw new Error('Unsafe artifact path');
+                if (downloaded.tempFilePath && fs.existsSync(downloaded.tempFilePath)) {
+                  fs.renameSync(downloaded.tempFilePath, outPath);
+                } else {
+                  fs.writeFileSync(outPath, downloaded.buffer);
+                }
+                hasArtifact = true;
+              }
+              if (process.env.GITHUB_OUTPUT) {
+                fs.appendFileSync(process.env.GITHUB_OUTPUT, hasArtifact ? `has_artifact=true\nartifact_dir=${outDir}\n` : `has_artifact=false\n`);
+              }
+
+              const altLines = results.slice(0, 6).map((item, idx) => {
+                const mb = (item.sizeBytes / (1024 * 1024)).toFixed(2);
+                return `${idx + 1}. ${item.title} (${mb} MB · ${item.sourceLabel})\n   ${item.directUrl}`;
+              });
+              const sizeMb = (downloaded.sizeBytes / (1024 * 1024)).toFixed(2);
+              const subject = customSubject || `תוצאת חיפוש (${query}): ${top.title}`;
+
+              if (downloaded.tooLargeForEmail) {
+                await transporter.sendMail({
+                  from: gmailUser,
+                  to,
+                  subject,
+                  text: [
+                    `נמצא הקובץ "${top.title}" (${sizeMb} MB) עבור החיפוש "${query}", אך הוא גדול ממגבלת הצרופה של Gmail (18 MB).`,
+                    '',
+                    `קישור ישיר להורדה:`,
+                    downloaded.resolvedUrl,
+                    !downloaded.oversizeArtifact ? `\nהורדה מלאה ב-GitHub Actions Artifacts (עד 2 GB):\n${runUrl}` : '',
+                    '',
+                    'תוצאות נוספות שנמצאו:',
+                    ...altLines,
+                  ].filter(Boolean).join('\n'),
+                });
+              } else {
+                await transporter.sendMail({
+                  from: gmailUser,
+                  to,
+                  subject,
+                  text: [
+                    `מצורף הקובץ "${top.title}" (${sizeMb} MB) שנמצא עבור החיפוש "${query}" (${top.sourceLabel}).`,
+                    '',
+                    'תוצאות נוספות שנמצאו:',
+                    ...altLines,
+                  ].join('\n'),
+                  attachments: [{ filename: finalName, content: downloaded.buffer, contentType: downloaded.mime }],
+                });
+              }
+              console.log(`Cloud search sent ${finalName} (${sizeMb} MB) to ${to}`);
+              return;
+            }
+
+            const validatedTarget = await validatePublicUrl(targetUrl);
 
             if (isGeminiShareUrl(validatedTarget)) {
               const geminiAssets = await resolveGeminiShareUrls(validatedTarget);
@@ -1038,8 +1881,11 @@ jobs:
             const targetUrl = (process.env.TARGET_URL || '').trim();
             const runUrl = process.env.RUN_URL || '';
 
-            if (gmailUser && gmailPass && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to) && !/EAUTH|535|Username and Password not accepted/i.test(msg)) {
+            const isJsonSearch = targetUrl.startsWith('search-json:');
+
+            if (!isJsonSearch && gmailUser && gmailPass && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to) && !/EAUTH|535|Username and Password not accepted/i.test(msg)) {
               try {
+                const nodemailer = require('nodemailer');
                 const transporter = nodemailer.createTransport({
                   host: 'smtp.gmail.com',
                   port: 465,
