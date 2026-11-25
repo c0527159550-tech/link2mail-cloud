@@ -1,5 +1,5 @@
 name: Link2Mail Cloud Downloader
-# LINK2MAIL_WORKFLOW_V5
+# LINK2MAIL_WORKFLOW_V6
 
 on:
   workflow_dispatch:
@@ -584,6 +584,30 @@ jobs:
             return val;
           }
 
+          function buildAcceptHeaderForUrl(urlOrObj) {
+            let pathname = '';
+            try {
+              const u = typeof urlOrObj === 'string' ? new URL(urlOrObj) : urlOrObj;
+              pathname = (u && u.pathname ? u.pathname : '').toLowerCase();
+            } catch {}
+            if (/\.(?:jpe?g|png|gif|bmp)(?:$|\?)/i.test(pathname)) {
+              return 'image/jpeg,image/png,image/gif,image/*,*/*;q=0.8';
+            }
+            if (/\.webp(?:$|\?)/i.test(pathname)) {
+              return 'image/webp,image/*,*/*;q=0.8';
+            }
+            if (/\.avif(?:$|\?)/i.test(pathname)) {
+              return 'image/avif,image/*,*/*;q=0.8';
+            }
+            if (/\.(?:mp3|m4a|wav|ogg|oga|opus|aac|flac)(?:$|\?)/i.test(pathname)) {
+              return 'audio/*,*/*;q=0.8';
+            }
+            if (/\.(?:mp4|webm|mov|mkv|avi|m4v)(?:$|\?)/i.test(pathname)) {
+              return 'video/*,*/*;q=0.8';
+            }
+            return 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,audio/*,video/*,*/*;q=0.8';
+          }
+
           function inferFilename(urlObj, disp, mime) {
             if (disp) {
               const u = disp.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
@@ -597,7 +621,15 @@ jobs:
             try { seg = sanitizeFilename(decodeURIComponent(urlObj.pathname.split('/').filter(Boolean).pop() || '')); } catch {}
             const ext = MIME_TO_EXT[mime] || '';
             if (seg && seg !== 'uc' && seg !== 'download' && seg !== 'export') {
-              return !path.extname(seg) && ext ? `${seg}${ext}` : seg;
+              const curExt = path.extname(seg).toLowerCase();
+              if (!curExt && ext) return `${seg}${ext}`;
+              if (ext && curExt && curExt !== ext && !(curExt === '.jpeg' && ext === '.jpg')) {
+                const knownImageOrMedia = mime.startsWith('image/') || mime.startsWith('audio/') || mime.startsWith('video/') || mime === 'application/pdf';
+                if (knownImageOrMedia) {
+                  return `${seg.slice(0, seg.length - curExt.length)}${ext}`;
+                }
+              }
+              return seg;
             }
             return `file-${Date.now()}${ext || '.bin'}`;
           }
@@ -974,7 +1006,7 @@ jobs:
                   '--proto-redir', '=http,https',
                   '--max-filesize', String(MAX_ARTIFACT_BYTES),
                   '-A', userAgent,
-                  '-H', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,audio/*,video/*,*/*;q=0.8',
+                  '-H', `Accept: ${buildAcceptHeaderForUrl(urlToFetch)}`,
                   '-H', 'Accept-Language: he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7',
                   '-H', 'Sec-Fetch-Dest: document',
                   '-H', 'Sec-Fetch-Mode: navigate',
@@ -1311,10 +1343,10 @@ jobs:
             const parsedInitial = new URL(normalizedUrl);
             const cookieJar = createCookieJar();
 
-            const buildBrowserHeaders = (ref) => {
+            const buildBrowserHeaders = (ref, acceptTarget = parsedInitial) => {
               const h = {
                 'User-Agent': CHROME_USER_AGENT,
-                Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,audio/*,video/*,*/*;q=0.8',
+                Accept: buildAcceptHeaderForUrl(acceptTarget),
                 'Accept-Language': 'he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7',
                 'Sec-Fetch-Dest': 'document',
                 'Sec-Fetch-Mode': 'navigate',
@@ -1344,7 +1376,7 @@ jobs:
                   timeoutMs: 12000,
                   maxRedirects: 4,
                   cookieJar,
-                  headers: buildBrowserHeaders(''),
+                  headers: buildBrowserHeaders('', `${parsedInitial.origin}/`),
                 });
                 res = await httpRequestWithLargeHeaders(normalizedUrl, {
                   method: 'GET',
