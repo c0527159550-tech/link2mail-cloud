@@ -1,5 +1,5 @@
 name: Link2Mail Cloud Downloader
-# LINK2MAIL_WORKFLOW_V5
+# LINK2MAIL_WORKFLOW_V4
 
 on:
   workflow_dispatch:
@@ -1055,51 +1055,6 @@ jobs:
             return null;
           }
 
-          async function tryImageCdnMirrorFallback(validatedUrl) {
-            const host = validatedUrl.hostname.toLowerCase();
-            if (validatedUrl.port || validatedUrl.username || validatedUrl.password) return null;
-            if (host.endsWith('.wp.com') || host === 'wp.com') return null;
-            const isImageOrWpPath =
-              /\.(?:jpe?g|png|webp|gif|avif|bmp)(?:$|\?)/i.test(validatedUrl.pathname) ||
-              /\/wp-content\/uploads\//i.test(validatedUrl.pathname);
-            if (!isImageOrWpPath) return null;
-
-            const mirrorUrl = new URL(`https://i0.wp.com/${host}${validatedUrl.pathname}${validatedUrl.search}`);
-            if (validatedUrl.protocol === 'https:') {
-              mirrorUrl.searchParams.set('ssl', '1');
-            }
-            try {
-              const res = await httpRequestWithLargeHeaders(mirrorUrl.toString(), {
-                method: 'GET',
-                maxBytes: MAX_ARTIFACT_BYTES,
-                timeoutMs: 30000,
-                maxRedirects: 4,
-                allowDiskStream: true,
-                headers: {
-                  'User-Agent': CHROME_USER_AGENT,
-                  Accept: /\.webp(?:$|\?)/i.test(validatedUrl.pathname)
-                    ? 'image/webp,image/*,*/*;q=0.8'
-                    : /\.avif(?:$|\?)/i.test(validatedUrl.pathname)
-                      ? 'image/avif,image/*,*/*;q=0.8'
-                      : 'image/jpeg,image/png,image/gif,image/*,*/*;q=0.8',
-                },
-              });
-              const mime = (res.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
-              const size = res.tempFilePath ? res.declaredSize : res.buffer.byteLength;
-              if (res.status >= 200 && res.status < 300 && size > 0 && mime && mime !== 'text/html') {
-                return {
-                  ...res,
-                  finalUrl: validatedUrl,
-                  mime,
-                };
-              }
-              if (res.tempFilePath && fs.existsSync(res.tempFilePath)) {
-                try { fs.unlinkSync(res.tempFilePath); } catch {}
-              }
-            } catch {}
-            return null;
-          }
-
           async function downloadWithBrowserChallengeSolver(targetUrlStr) {
             const chromePath = await findChromeBinary();
             if (!chromePath) return null;
@@ -1137,6 +1092,7 @@ jobs:
 
             let ws = null;
             try {
+              // Wait for CDP endpoint
               let pageWsUrl = null;
               for (let attempt = 0; attempt < 30; attempt++) {
                 await new Promise((r) => setTimeout(r, 250));
@@ -1184,7 +1140,7 @@ jobs:
                 ws.send(JSON.stringify({ id, method, params }));
               });
 
-              ws.on('message', (raw) => {
+              ws.on('message', async (raw) => {
                 let msg;
                 try { msg = JSON.parse(String(raw)); } catch { return; }
                 if (msg.id && pending.has(msg.id)) {
@@ -1194,7 +1150,26 @@ jobs:
                   else p.resolve(msg.result || {});
                   return;
                 }
-                if (msg.method === 'Network.responseReceived' && msg.params && msg.params.response) {
+                if (msg.method === 'Fetch.requestPaused' && msg.params) {
+                  const { requestId, request } = msg.params;
+                  const rUrl = (request && request.url) || '';
+                  let allowed = false;
+                  if (rUrl.startsWith('http://') || rUrl.startsWith('https://')) {
+                    try {
+                      await validatePublicUrl(rUrl);
+                      allowed = true;
+                    } catch {
+                      allowed = false;
+                    }
+                  } else if (/^(?:data:|blob:|about:)/i.test(rUrl)) {
+                    allowed = true;
+                  }
+                  if (allowed) {
+                    sendCdp('Fetch.continueRequest', { requestId }).catch(() => {});
+                  } else {
+                    sendCdp('Fetch.failRequest', { requestId, errorReason: 'AccessDenied' }).catch(() => {});
+                  }
+                } else if (msg.method === 'Network.responseReceived' && msg.params && msg.params.response) {
                   const r = msg.params.response;
                   if (r.url === validated.toString() && r.status >= 200 && r.status < 300) {
                     const mt = (r.mimeType || '').toLowerCase();
@@ -1211,26 +1186,34 @@ jobs:
                 }
               });
 
-              // Avoid Runtime.enable & Fetch.enable while Cloudflare challenge executes
               await sendCdp('Page.enable');
               await sendCdp('Network.enable');
+              await sendCdp('Runtime.enable');
+              await sendCdp('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+              await sendCdp('Page.addScriptToEvaluateOnNewDocument', {
+                source: 'Object.defineProperty(navigator, "webdriver", { get: () => undefined });',
+              });
 
+              const uaEval = await sendCdp('Runtime.evaluate', { expression: 'navigator.userAgent', returnByValue: true });
+              const realUa = (uaEval && uaEval.result && uaEval.result.value) || CHROME_USER_AGENT;
+
+              // Visit site origin first if target looks like a direct asset, or visit target directly
               const isDirectAsset = /\.(?:jpe?g|png|gif|webp|avif|mp3|mp4|pdf|zip|docx?|xlsx?|pptx?|m4a|wav|webm)(?:$|\?)/i.test(validated.pathname);
               const firstUrl = isDirectAsset ? `${validated.origin}/` : validated.toString();
               await sendCdp('Page.navigate', { url: firstUrl });
 
+              // Wait up to 11s for Cloudflare JS challenge or cf_clearance cookie
               let cleared = false;
               let latestCookies = [];
-              for (let tick = 0; tick < 28; tick++) {
+              for (let tick = 0; tick < 22; tick++) {
                 await new Promise((r) => setTimeout(r, 500));
                 try {
                   const ckRes = await sendCdp('Network.getAllCookies');
                   latestCookies = (ckRes && ckRes.cookies) || [];
-                  if (latestCookies.some((c) => c.name === 'cf_clearance')) {
-                    cleared = true;
-                    break;
-                  }
-                  if (capturedTargetResponse) {
+                  const hasClearance = latestCookies.some((c) => c.name === 'cf_clearance');
+                  const titleEval = await sendCdp('Runtime.evaluate', { expression: 'document.title', returnByValue: true });
+                  const pageTitle = String((titleEval && titleEval.result && titleEval.result.value) || '');
+                  if (hasClearance || (pageTitle && !/just a moment|attention required|cloudflare/i.test(pageTitle))) {
                     cleared = true;
                     break;
                   }
@@ -1248,11 +1231,6 @@ jobs:
 
               if (cookieStr) {
                 try {
-                  let realUa = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
-                  try {
-                    const uaEval = await sendCdp('Runtime.evaluate', { expression: 'navigator.userAgent', returnByValue: true });
-                    if (uaEval && uaEval.result && uaEval.result.value) realUa = uaEval.result.value;
-                  } catch {}
                   const curlAfterBrowser = await downloadViaCurl(validated.toString(), `${validated.origin}/`, cookieStr, realUa);
                   if (curlAfterBrowser.status >= 200 && curlAfterBrowser.status < 300) {
                     return curlAfterBrowser;
@@ -1260,6 +1238,7 @@ jobs:
                 } catch {}
               }
 
+              // Fallback: navigate directly to target inside Chrome and try grabbing Network body
               if (firstUrl !== validated.toString()) {
                 await sendCdp('Page.navigate', { url: validated.toString() });
                 for (let tick = 0; tick < 16; tick++) {
@@ -1375,15 +1354,7 @@ jobs:
               }
             }
 
-            // Layer 2.5: Image CDN mirror (i0.wp.com) for Cloudflare-blocked WordPress / public image URLs
-            if ([403, 429, 503].includes(res.status)) {
-              const cdnRes = await tryImageCdnMirrorFallback(parsedInitial);
-              if (cdnRes) {
-                res = cdnRes;
-              }
-            }
-
-            // Layer 3: Real Chrome CDP challenge solver if still blocked
+            // Layer 3: Real Chrome CDP challenge solver if blocked by Cloudflare JS challenge or persistent 403
             let cloudflareBlockedAfterBrowser = isCloudflareChallengeResponse(res.status, res.headers, res.buffer);
             if ([403, 429, 503].includes(res.status)) {
               const browserRes = await downloadWithBrowserChallengeSolver(normalizedUrl);
