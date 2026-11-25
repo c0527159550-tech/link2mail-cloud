@@ -1,5 +1,5 @@
 name: Link2Mail Cloud Downloader
-# LINK2MAIL_WORKFLOW_V6
+# LINK2MAIL_WORKFLOW_V7
 
 on:
   workflow_dispatch:
@@ -62,8 +62,30 @@ jobs:
           const os = require('node:os');
           const path = require('node:path');
           const { promisify } = require('node:util');
+          const zlib = require('node:zlib');
 
           const execFileAsync = promisify(execFile);
+
+          function moveFileSafe(src, dest) {
+            try {
+              fs.renameSync(src, dest);
+            } catch (err) {
+              if (err && err.code === 'EXDEV') {
+                fs.copyFileSync(src, dest);
+                try { fs.unlinkSync(src); } catch {}
+              } else {
+                throw err;
+              }
+            }
+          }
+
+          function capArtifactFilename(name) {
+            const clean = sanitizeFilename(name);
+            if (clean.length <= 90) return clean;
+            const ext = path.extname(clean).slice(0, 16);
+            const base = clean.slice(0, clean.length - ext.length);
+            return `${base.slice(0, Math.max(12, 90 - ext.length))}${ext}`;
+          }
 
           const MAX_EMAIL_BYTES = 18 * 1024 * 1024;
           const MAX_MULTI_EMAIL_BYTES = 17 * 1024 * 1024;
@@ -385,11 +407,38 @@ jobs:
 
                   const chunks = [];
                   let totalBytes = 0;
+                  let wireBytes = 0;
+
+                  res.on('data', (rawChunk) => {
+                    wireBytes += rawChunk.byteLength;
+                  });
+
+                  res.on('aborted', () => {
+                    if (settled) return;
+                    if (req) req.destroy();
+                    finishReject(new Error('Download stream aborted before completion'));
+                  });
+
+                  const contentEncoding = (headers['content-encoding'] || '').split(',')[0].trim().toLowerCase();
+                  let bodyStream = res;
+                  if (contentEncoding === 'gzip' || contentEncoding === 'x-gzip') {
+                    const gunzip = zlib.createGunzip();
+                    res.pipe(gunzip);
+                    bodyStream = gunzip;
+                  } else if (contentEncoding === 'deflate') {
+                    const inflate = zlib.createInflate();
+                    res.pipe(inflate);
+                    bodyStream = inflate;
+                  } else if (contentEncoding === 'br') {
+                    const brotli = zlib.createBrotliDecompress();
+                    res.pipe(brotli);
+                    bodyStream = brotli;
+                  }
 
                   const ensureTempStream = () => {
                     if (tempStream) return;
-                    fs.mkdirSync(ARTIFACT_OUT_DIR, { recursive: true });
-                    tempFilePath = path.join(ARTIFACT_OUT_DIR, `_dl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.part`);
+                    const tmpDir = os.tmpdir();
+                    tempFilePath = path.join(tmpDir, `_l2m_dl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.part`);
                     tempStream = fs.createWriteStream(tempFilePath);
                     tempStream.on('error', (err) => {
                       if (res) res.destroy();
@@ -405,7 +454,7 @@ jobs:
                     ensureTempStream();
                   }
 
-                  res.on('data', (chunk) => {
+                  bodyStream.on('data', (chunk) => {
                     if (settled) return;
                     totalBytes += chunk.byteLength;
                     if (totalBytes > options.maxBytes) {
@@ -429,10 +478,10 @@ jobs:
                     }
                     if (tempStream) {
                       const canContinue = tempStream.write(chunk);
-                      if (!canContinue) res.pause();
+                      if (!canContinue && bodyStream.pause) bodyStream.pause();
                       if (!tempStream.listenerCount('drain')) {
                         tempStream.once('drain', () => {
-                          if (!settled && activeRes) activeRes.resume();
+                          if (!settled && bodyStream.resume) bodyStream.resume();
                         });
                       }
                     } else {
@@ -440,9 +489,18 @@ jobs:
                     }
                   });
 
-                  res.on('end', () => {
+                  bodyStream.on('end', () => {
                     if (settled) return;
-                    const finalSize = !Number.isNaN(declaredSize) && declaredSize > 0 ? Math.max(declaredSize, totalBytes) : totalBytes;
+                    if (
+                      res.complete === false ||
+                      (!Number.isNaN(declaredSize) && declaredSize > 0 && wireBytes < declaredSize)
+                    ) {
+                      finishReject(new Error(`Incomplete download (${wireBytes}/${declaredSize || '?'} bytes received)`));
+                      return;
+                    }
+                    const finalSize = !contentEncoding && !Number.isNaN(declaredSize) && declaredSize > 0
+                      ? Math.max(declaredSize, totalBytes)
+                      : totalBytes;
                     if (tempStream) {
                       const savedPath = tempFilePath;
                       tempStream.end(() => {
@@ -472,7 +530,10 @@ jobs:
                     }
                   });
 
-                  res.on('error', finishReject);
+                  bodyStream.on('error', finishReject);
+                  if (bodyStream !== res) {
+                    res.on('error', finishReject);
+                  }
                 }
               );
 
@@ -1058,9 +1119,8 @@ jobs:
 
               let movedTempPath = null;
               if (actualSize > MAX_EMAIL_BYTES && fileStats) {
-                fs.mkdirSync(ARTIFACT_OUT_DIR, { recursive: true });
-                movedTempPath = path.join(ARTIFACT_OUT_DIR, `_curl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.part`);
-                fs.renameSync(bodyPath, movedTempPath);
+                movedTempPath = path.join(os.tmpdir(), `_l2m_curl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.part`);
+                moveFileSafe(bodyPath, movedTempPath);
               }
 
               const mime = (curlMeta.contentType || headers['content-type'] || 'application/octet-stream').split(';')[0].trim().toLowerCase();
@@ -1202,6 +1262,7 @@ jobs:
               let nextId = 1;
               const pending = new Map();
               let capturedTargetResponse = null;
+              const finishedRequestIds = new Set();
 
               const sendCdp = (method, params = {}) => new Promise((resolve, reject) => {
                 const id = nextId++;
@@ -1224,6 +1285,10 @@ jobs:
                   pending.delete(msg.id);
                   if (msg.error) p.reject(new Error(msg.error.message || 'CDP error'));
                   else p.resolve(msg.result || {});
+                  return;
+                }
+                if (msg.method === 'Network.loadingFinished' && msg.params && msg.params.requestId) {
+                  finishedRequestIds.add(msg.params.requestId);
                   return;
                 }
                 if (msg.method === 'Network.responseReceived' && msg.params && msg.params.response) {
@@ -1296,11 +1361,14 @@ jobs:
                 await sendCdp('Page.navigate', { url: validated.toString() });
                 for (let tick = 0; tick < 16; tick++) {
                   await new Promise((r) => setTimeout(r, 500));
-                  if (capturedTargetResponse) break;
+                  if (capturedTargetResponse && finishedRequestIds.has(capturedTargetResponse.requestId)) break;
                 }
               }
 
               if (capturedTargetResponse) {
+                for (let waitTick = 0; waitTick < 12 && !finishedRequestIds.has(capturedTargetResponse.requestId); waitTick++) {
+                  await new Promise((r) => setTimeout(r, 250));
+                }
                 try {
                   const bodyRes = await sendCdp('Network.getResponseBody', { requestId: capturedTargetResponse.requestId });
                   if (bodyRes && typeof bodyRes.body === 'string') {
@@ -1469,7 +1537,22 @@ jobs:
               throw new Error(`Downloaded empty file (0 bytes) from ${res.finalUrl.hostname}`);
             }
 
-            if (allowEmbeddedRetry && mime === 'text/html' && !res.tempFilePath) {
+            const headBytes = res.tempFilePath
+              ? (() => {
+                  const fd = fs.openSync(res.tempFilePath, 'r');
+                  try {
+                    const b = Buffer.alloc(512);
+                    const n = fs.readSync(fd, b, 0, 512, 0);
+                    return b.subarray(0, n);
+                  } finally {
+                    fs.closeSync(fd);
+                  }
+                })()
+              : res.buffer.subarray(0, 512);
+            const headAscii = headBytes.toString('utf8').trimStart().toLowerCase();
+            const looksLikeHtmlBody = headAscii.startsWith('<!doctype html') || headAscii.startsWith('<html');
+
+            if (allowEmbeddedRetry && (mime === 'text/html' || looksLikeHtmlBody) && !res.tempFilePath) {
               const embedded = extractEmbeddedMedia(res.finalUrl, res.buffer.subarray(0, 524288).toString('utf8'));
               if (embedded) {
                 try {
@@ -1480,6 +1563,30 @@ jobs:
                 } catch (subErr) {
                   console.warn('Embedded media retry failed:', subErr && subErr.message ? subErr.message : subErr);
                 }
+              }
+            }
+
+            const expectsZip =
+              filename.toLowerCase().endsWith('.zip') ||
+              mime === 'application/zip' ||
+              mime === 'application/x-zip-compressed';
+            if (expectsZip) {
+              const validZipMagic =
+                headBytes.byteLength >= 4 &&
+                headBytes[0] === 0x50 &&
+                headBytes[1] === 0x4b &&
+                ((headBytes[2] === 0x03 && headBytes[3] === 0x04) ||
+                  (headBytes[2] === 0x05 && headBytes[3] === 0x06) ||
+                  (headBytes[2] === 0x07 && headBytes[3] === 0x08));
+              if (!validZipMagic) {
+                if (res.tempFilePath && fs.existsSync(res.tempFilePath)) {
+                  try { fs.unlinkSync(res.tempFilePath); } catch {}
+                }
+                throw new Error(
+                  looksLikeHtmlBody
+                    ? `הקישור החזיר עמוד HTML (ייתכן דף אישור הורדה או חסימה ב-${res.finalUrl.hostname}) במקום קובץ ZIP תקין.`
+                    : `הקובץ שהורד מ-${res.finalUrl.hostname} אינו קובץ ZIP תקין (מבנה הארכיון פגום).`
+                );
               }
             }
 
@@ -1757,10 +1864,10 @@ jobs:
               const finalName = customFilename ? sanitizeFilename(customFilename) : (top.filename || downloaded.filename);
 
               if (downloaded.tooLargeForEmail && !downloaded.oversizeArtifact) {
-                const outPath = path.resolve(outDir, finalName);
+                const outPath = path.resolve(outDir, capArtifactFilename(finalName));
                 if (!outPath.startsWith(outDir + path.sep)) throw new Error('Unsafe artifact path');
                 if (downloaded.tempFilePath && fs.existsSync(downloaded.tempFilePath)) {
-                  fs.renameSync(downloaded.tempFilePath, outPath);
+                  moveFileSafe(downloaded.tempFilePath, outPath);
                 } else {
                   fs.writeFileSync(outPath, downloaded.buffer);
                 }
@@ -1836,10 +1943,10 @@ jobs:
                 } else {
                   overflowLinks.push(`${name} (${(asset.sizeBytes / (1024 * 1024)).toFixed(2)} MB): ${asset.resolvedUrl}`);
                   if (!asset.oversizeArtifact) {
-                    const outPath = path.resolve(outDir, name);
+                    const outPath = path.resolve(outDir, capArtifactFilename(name));
                     if (!outPath.startsWith(outDir + path.sep)) throw new Error('Unsafe artifact path');
                     if (asset.tempFilePath && fs.existsSync(asset.tempFilePath)) {
-                      fs.renameSync(asset.tempFilePath, outPath);
+                      moveFileSafe(asset.tempFilePath, outPath);
                     } else {
                       fs.writeFileSync(outPath, asset.buffer);
                     }
@@ -1879,12 +1986,12 @@ jobs:
             const finalName = customFilename ? sanitizeFilename(customFilename) : result.filename;
 
             if (result.tooLargeForEmail && !result.oversizeArtifact) {
-              const outPath = path.resolve(outDir, finalName);
+              const outPath = path.resolve(outDir, capArtifactFilename(finalName));
               if (!outPath.startsWith(outDir + path.sep)) {
                 throw new Error('Unsafe artifact path');
               }
               if (result.tempFilePath && fs.existsSync(result.tempFilePath)) {
-                fs.renameSync(result.tempFilePath, outPath);
+                moveFileSafe(result.tempFilePath, outPath);
               } else {
                 fs.writeFileSync(outPath, result.buffer);
               }
