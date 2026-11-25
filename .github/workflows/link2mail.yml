@@ -1077,7 +1077,11 @@ jobs:
                 allowDiskStream: true,
                 headers: {
                   'User-Agent': CHROME_USER_AGENT,
-                  Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+                  Accept: /\.webp(?:$|\?)/i.test(validatedUrl.pathname)
+                    ? 'image/webp,image/*,*/*;q=0.8'
+                    : /\.avif(?:$|\?)/i.test(validatedUrl.pathname)
+                      ? 'image/avif,image/*,*/*;q=0.8'
+                      : 'image/jpeg,image/png,image/gif,image/*,*/*;q=0.8',
                 },
               });
               const mime = (res.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
